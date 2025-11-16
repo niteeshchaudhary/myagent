@@ -1,0 +1,26 @@
+app:
+  name: "CodingAgent"
+  version: "1.0.0"
+  mode: "production"   # dev | test | production
+
+logging:
+  level: "INFO"         # DEBUG | INFO | WARNING | ERROR
+  file: "logs/agent.log"
+  max_size_mb: 5
+  backups: 3
+
+agent:
+  max_steps: 20
+  enable_memory: true
+  verbose: true
+  allow_risky_commands: false  # prevents rm -rf, shutdown, etc.
+
+paths:
+  workspace: "./workspace"
+  temp: "./temp"
+  models: "./models"
+
+system:
+  allow_subprocess: true
+  allow_internet: true
+  allow_file_access: true

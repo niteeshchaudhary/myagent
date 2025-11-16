@@ -1,0 +1,40 @@
+default_model: "groq-model-x"
+
+models:
+  gpt-4.1-mini:
+    provider: "openai"
+    model: "gpt-4.1-mini"
+    temperature: 0.2
+    max_tokens: 4096
+
+  gpt-4.1:
+    provider: "openai"
+    model: "gpt-4.1"
+    temperature: 0.1
+    max_tokens: 8192
+
+  llama3.1-8b:
+    provider: "local"
+    model_path: "./models/llama3.1-8b.gguf"
+    temperature: 0.3
+    max_tokens: 4096
+
+  claude-3.7-sonnet:
+    provider: "anthropic"
+    model: "claude-3.7-sonnet"
+    temperature: 0.2
+    max_tokens: 8192
+
+  groq-model-x:
+    provider: "groq"
+    model_name: "qwen/qwen3-32b"
+    temperature: 0.2
+    max_tokens: 4096
+    api_key_env: "GROQ_API_KEY"   # environment variable to read API key
+
+  ollama-model-y:
+    provider: "ollama"
+    model_name: "qwen3-coder:30b"
+    temperature: 0.2
+    max_tokens: 4096
+    endpoint: "http://localhost:11434"   # for local Ollama server

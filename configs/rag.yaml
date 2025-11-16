@@ -1,0 +1,13 @@
+rag:
+  enabled: true
+  index_path: ".agent_index"
+  store_type: "faiss"           # faiss | chroma | redis | inmemory
+  embed_backend: "auto"         # auto | openai | local
+  openai_model: "text-embedding-3-small"
+  local_model: "sentence-transformers/all-MiniLM-L6-v2"
+  chunk_size_tokens: 500
+  chunk_overlap_tokens: 80
+  top_k: 8
+  max_chunk_chars: 3000
+  incremental_index_on_commit: false
+  index_schedule_cron: "0 3 * * *" # optional, run nightly reindex

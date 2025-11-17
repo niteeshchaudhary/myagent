@@ -127,17 +127,52 @@ class AgentLoop:
     def _safe_memory_snapshot(self) -> Dict[str, Any]:
         """
         Attempt to produce a lightweight snapshot / summary of memory to pass into planner.
+        Prioritizes recent conversation history.
         """
         try:
-            if hasattr(self.memory, "snapshot"):
-                return self.memory.snapshot()
-            if hasattr(self.memory, "to_dict"):
-                return self.memory.to_dict()
+            snapshot = {}
+            
+            # Get all memory items
             if hasattr(self.memory, "recall_all"):
-                return {"history": self.memory.recall_all()}
-            if hasattr(self.memory, "load"):
-                return {"loaded": self.memory.load()}
-            return {}
+                all_items = self.memory.recall_all()
+                # Extract recent conversation history (prompts and responses)
+                conversation_history = []
+                for item in all_items[:20]:  # Get most recent 20 items
+                    content = item.get("content", {})
+                    if isinstance(content, dict):
+                        # Look for prompts and responses
+                        if "prompt" in content or "response" in content:
+                            conversation_history.append({
+                                "prompt": content.get("prompt", ""),
+                                "response": content.get("response", ""),
+                                "timestamp": item.get("timestamp", content.get("timestamp", 0))
+                            })
+                        # Also include tool executions that might be relevant
+                        elif "tool" in content:
+                            conversation_history.append({
+                                "tool": content.get("tool"),
+                                "input": str(content.get("input", ""))[:200],  # Truncate long inputs
+                                "output": str(content.get("output", ""))[:200] if isinstance(content.get("output"), dict) else str(content.get("output", ""))[:200],
+                                "timestamp": item.get("timestamp", content.get("timestamp", 0))
+                            })
+                
+                snapshot["conversation_history"] = conversation_history
+                snapshot["total_memory_items"] = len(all_items)
+            
+            # Also include full snapshot if available (for other context)
+            if hasattr(self.memory, "snapshot"):
+                full_snapshot = self.memory.snapshot()
+                # Merge but prioritize conversation_history
+                for key, value in full_snapshot.items():
+                    if key not in snapshot:
+                        snapshot[key] = value
+            elif hasattr(self.memory, "to_dict"):
+                full_dict = self.memory.to_dict()
+                for key, value in full_dict.items():
+                    if key not in snapshot:
+                        snapshot[key] = value
+            
+            return snapshot
         except Exception as e:
             logger.debug("Memory snapshot failed: %s", e)
             return {}

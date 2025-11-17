@@ -252,6 +252,15 @@ class Planner:
                 else:
                     truncated_memory["files"] = files
             
+            # ALWAYS prioritize conversation_history - it's critical for context
+            if "conversation_history" in memory:
+                conv_history = memory["conversation_history"]
+                if isinstance(conv_history, list):
+                    # Keep most recent conversations (they're already sorted newest-first)
+                    truncated_memory["conversation_history"] = conv_history[:15]  # Keep last 15 conversations
+                    if len(conv_history) > 15:
+                        truncated_memory["_truncated_conversations"] = len(conv_history) - 15
+            
             # Keep recent items (if memory has items list)
             if "items" in memory and isinstance(memory["items"], list):
                 # Keep most recent items, but limit total
@@ -259,9 +268,9 @@ class Planner:
                 truncated_memory["items"] = items
                 truncated_memory["_truncated_items"] = len(memory["items"]) - len(items)
             
-            # Copy other small keys
+            # Copy other small keys (but prioritize conversation_history)
             for key, value in memory.items():
-                if key not in ("available_tools", "files", "items"):
+                if key not in ("available_tools", "files", "items", "conversation_history"):
                     value_str = json.dumps(value) if not isinstance(value, str) else value
                     if self._estimate_tokens(value_str) < 500:  # Keep small values
                         truncated_memory[key] = value
@@ -517,7 +526,60 @@ class Planner:
             )
         
         if memory:
-            parts.append(f"Memory/context (useful facts):\n{json.dumps(memory, indent=2)}\n")
+            # Format memory with emphasis on conversation history
+            memory_parts = []
+            
+            # Prioritize conversation history
+            if isinstance(memory, dict) and "conversation_history" in memory:
+                conv_history = memory.get("conversation_history", [])
+                if conv_history:
+                    memory_parts.append("Recent conversation history (most recent first):\n")
+                    for i, conv in enumerate(conv_history[:10], 1):  # Show last 10 conversations
+                        prompt = conv.get("prompt", "")
+                        response = conv.get("response", "")
+                        tool_info = conv.get("tool", "")
+                        
+                        if prompt or response:
+                            memory_parts.append(f"\n--- Conversation {i} ---")
+                            if prompt:
+                                memory_parts.append(f"User: {prompt[:300]}{'...' if len(prompt) > 300 else ''}")
+                            if response:
+                                resp_str = str(response)[:300] + ('...' if len(str(response)) > 300 else '')
+                                memory_parts.append(f"Agent: {resp_str}")
+                        elif tool_info:
+                            memory_parts.append(f"\n--- Action {i} ---")
+                            memory_parts.append(f"Tool: {tool_info}")
+                            if conv.get("input"):
+                                memory_parts.append(f"Input: {str(conv.get('input'))[:200]}")
+                    
+                    memory_parts.append("\n")
+            
+            # Add other memory context
+            other_memory = {}
+            if isinstance(memory, dict):
+                for key, value in memory.items():
+                    if key != "conversation_history" and key != "available_tools":
+                        # Only include small values to avoid token bloat
+                        value_str = json.dumps(value) if not isinstance(value, str) else value
+                        if self._estimate_tokens(value_str) < 1000:
+                            other_memory[key] = value
+            
+            if other_memory:
+                memory_parts.append("Other context:\n")
+                memory_parts.append(json.dumps(other_memory, indent=2))
+            
+            if memory_parts:
+                parts.append("Memory/context:\n" + "\n".join(memory_parts) + "\n")
+                # Add instruction to use conversation history
+                if isinstance(memory, dict) and "conversation_history" in memory and memory.get("conversation_history"):
+                    parts.append(
+                        "IMPORTANT: Use the conversation history above to understand the context of previous interactions. "
+                        "The current user request may be a follow-up to a previous conversation. "
+                        "Consider what was discussed, what files were created, what actions were taken, and build upon that context.\n\n"
+                    )
+            else:
+                # Fallback to JSON dump if no conversation history found
+                parts.append(f"Memory/context (useful facts):\n{json.dumps(memory, indent=2)}\n")
 
         expanded_prompt = expand_file_refs(prompt, repo_root=getattr(self, "repo_root", "."))
         parts.append("User request (expanded file references):\n" + expanded_prompt + "\n")

@@ -57,59 +57,6 @@ coding-agent/
 └── setup.py OR pyproject.toml
 
 
-coding-agent/
-│
-├── agent/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── agent_loop.py
-│   │   ├── planner.py
-│   │   ├── memory.py
-│   │   └── tool_manager.py
-│   │
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   ├── shell_tool.py
-│   │   ├── python_tool.py
-│   │   ├── file_tool.py
-│   │   ├── git_tool.py
-│   │   ├── installer_tool.py
-│   │   ├── web_search_tool.py   # Selenium
-│   │   └── os_tool.py
-│   │
-│   ├── llm/
-│   │   ├── __init__.py
-│   │   ├── openai_llm.py
-│   │   ├── local_llm.py
-│   │   └── model_selector.py
-│   │
-│   └── utils/
-│       ├── json_parser.py
-│       ├── logger.py
-│       └── os_detect.py
-│
-├── cli/
-│   ├── __init__.py
-│   └── main.py     # CLI interface (Typer/argparse)
-│
-├── configs/
-│   ├── config.yaml
-│   ├── models.yaml
-│   └── tools.yaml
-│
-├── logs/
-│   └── agent.log
-│
-├── tests/
-│   ├── test_tools.py
-│   ├── test_agent.py
-│   └── test_llm.py
-│
-├── requirements.txt
-├── README.md
-└── setup.py OR pyproject.toml
-
-
 📘 Coding Agent – README
 
 A lightweight, extensible terminal-based coding agent that uses planning, memory, tools, and multiple LLM providers (OpenAI, Groq, Ollama, or local models) to execute tasks.
@@ -317,14 +264,4 @@ Your coding agent is now ready to run with:
 
 coding-agent repl
 
-
-If you'd like, I can also generate:
-
-✅ A PyPi-ready setup.py
-✅ pyproject.toml for Poetry
-✅ Dockerfile for the whole agent
-✅ Example tools or workflows
-
-Just tell me!
-
-write a react code to create cms application
+::coding-agent <- name depends on the object file you create after compiling c code

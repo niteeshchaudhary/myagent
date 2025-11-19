@@ -1,0 +1,51 @@
+enabled_tools:
+  - shell
+  - python
+  - file
+  - git
+  - installer
+  - web_search
+  - os
+
+tools:
+
+  shell:
+    module: "tools.shell_tool"
+    class: "ShellTool"
+    allow_all_commands: false
+    blocked:
+      - "rm -rf"
+      - "shutdown"
+      - "mkfs"
+    timeout_sec: 60
+
+  python:
+    module: "tools.python_tool"
+    class: "PythonTool"
+    timeout_sec: 120
+
+  file:
+    module: "tools.file_tool"
+    class: "FileTool"
+    allow_write: true
+    allow_read: true
+    allow_delete: false
+
+  git:
+    module: "tools.git_tool"
+    class: "GitTool"
+
+  installer:
+    module: "tools.installer_tool"
+    class: "InstallerTool"
+    auto_install_missing: true
+
+  web_search:
+    module: "tools.web_search_tool"
+    class: "WebSearchTool"
+    engine: "google"
+    max_results: 5
+
+  os:
+    module: "tools.os_tool"
+    class: "OSTool"

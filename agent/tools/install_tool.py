@@ -1,8 +1,10 @@
 # tools/installer_tool.py
 
 import subprocess
-from utils.os_detect import OSDetect
-from utils.logger import logger
+from agent.utils.logger import get_logger
+from agent.utils.os_detect import get_os
+
+logger = get_logger(__name__)
 
 class InstallerTool:
 
@@ -29,7 +31,7 @@ class InstallerTool:
 
     @staticmethod
     def install_package(pkg):
-        os_type = OSDetect.get_os()
+        os_type = get_os()
 
         if os_type == "windows":
             cmd = ["choco", "install", pkg, "-y"]

@@ -14,6 +14,7 @@ agent:
   enable_memory: true
   verbose: true
   allow_risky_commands: false  # prevents rm -rf, shutdown, etc.
+  auto_index: true  # automatically index codebase when agent starts (repl/run commands)
 
 paths:
   workspace: "./workspace"
@@ -24,3 +25,18 @@ system:
   allow_subprocess: true
   allow_internet: true
   allow_file_access: true
+
+mcp:
+  enabled: true
+  servers:
+    # Example MCP server configurations
+    # - name: "filesystem"
+    #   command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+    #   env:
+    #     MCP_API_KEY: "your-key"
+    #   timeout: 30
+    # - name: "github"
+    #   command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+    #   env:
+    #     GITHUB_PERSONAL_ACCESS_TOKEN: "your-token"
+    #   timeout: 30

@@ -113,9 +113,15 @@ def _parse_rg_json_stream(json_text: str) -> List[RGHit]:
             path_text = path_dict.get("text") or path_dict.get("path", "")
             for sub in data.get("submatches", []):
                 match_text = sub.get("match", {}).get("text", "")
-                # position info
-                line_num = sub.get("start", {}).get("line") or data.get("line_number") or sub.get("start", {}).get("line_number")
-                col = sub.get("start", {}).get("column") or None
+                # position info - handle case where start might be int or dict
+                start_info = sub.get("start", {})
+                if isinstance(start_info, dict):
+                    line_num = start_info.get("line") or data.get("line_number") or start_info.get("line_number")
+                    col = start_info.get("column") or None
+                else:
+                    # start is an int (line number directly)
+                    line_num = start_info if isinstance(start_info, int) else data.get("line_number")
+                    col = None
                 # the full line text is provided in data.get("lines", {}).get("text")
                 line_text = (data.get("lines") or {}).get("text") or ""
                 # context is not provided by rg json by default; we'll leave None

@@ -187,30 +187,35 @@ class LocalLLM:
             raise RuntimeError(f"Ollama CLI error (rc={proc.returncode}): {stderr.strip()}")
 
         # Try to parse JSON response if possible; otherwise treat stdout as text
-        parsed = None
-        try:
-            parsed = json.loads(stdout)
-        except Exception:
-            # Some versions print text only; fallback
-            parsed = None
-
-        if isinstance(parsed, dict) and "text" in parsed:
-            text = parsed["text"]
-        else:
-            # If parsed is list-like or simple string, try extraction; else use raw stdout
-            if isinstance(parsed, list):
-                # heuristics: find first 'content' or 'text' in items
-                text = ""
-                for item in parsed:
-                    if isinstance(item, dict):
-                        for k in ("content", "text", "completion"):
-                            if k in item:
-                                text += str(item[k])
-                    else:
-                        text += str(item)
-                text = text.strip() or stdout.strip()
-            else:
-                text = stdout.strip()
+        # Ollama may return multiple JSON lines (one per chunk) or a single JSON object
+        text = ""
+        lines = stdout.strip().split("\n")
+        
+        # Try to parse each line as JSON and extract response/text
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    # Extract response or text field
+                    if "response" in parsed:
+                        text += parsed["response"]
+                    elif "text" in parsed:
+                        text += parsed["text"]
+                    elif "content" in parsed:
+                        text += parsed["content"]
+                    # If no text field, skip this line (might be metadata)
+                elif isinstance(parsed, str):
+                    text += parsed
+            except (json.JSONDecodeError, ValueError):
+                # Not JSON, treat as plain text
+                text += line + "\n"
+        
+        # If we didn't extract anything from JSON, use raw stdout
+        if not text.strip():
+            text = stdout.strip()
 
         return {"text": text, "provider": "ollama", "raw": stdout, "stderr": stderr}
 
@@ -254,8 +259,32 @@ class LocalLLM:
             for raw_line in iter(proc.stdout.readline, b""):
                 if not raw_line:
                     break
-                chunk = raw_line.decode("utf-8", errors="replace")
-                yield chunk
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                
+                # Ollama CLI outputs JSON lines with "response" field
+                # Parse JSON and extract the response text
+                try:
+                    import json
+                    data = json.loads(line)
+                    if isinstance(data, dict) and "response" in data:
+                        # Yield the response text chunk
+                        response_text = data.get("response", "")
+                        if response_text:
+                            yield response_text
+                    elif isinstance(data, dict) and "text" in data:
+                        # Some Ollama versions use "text" instead of "response"
+                        yield data.get("text", "")
+                    else:
+                        # If it's JSON but doesn't have response/text, skip it (might be metadata)
+                        # Only yield if it's not JSON at all
+                        if not isinstance(data, dict):
+                            yield line
+                        # Otherwise skip (it's JSON metadata without text)
+                except (json.JSONDecodeError, ValueError):
+                    # Not JSON, yield as plain text
+                    yield line
             # wait for process to finish
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

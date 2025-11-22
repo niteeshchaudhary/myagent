@@ -1,10 +1,18 @@
 rag:
   enabled: true
   index_path: ".agent_index"
-  store_type: "faiss"           # faiss | chroma | redis | inmemory
-  embed_backend: "auto"         # auto | openai | local
+  store_type: "redis"           # faiss | chroma | redis | inmemory
+  embed_backend: "local"         # auto | openai | local | groq
+                                # - "openai": Use OpenAI embeddings (requires OPENAI_API_KEY)
+                                # - "local": Use local sentence-transformers embeddings
+                                # - "groq": Use Groq LLM models for embeddings (requires GROQ_API_KEY and groq_model)
+                                # - "auto": Auto-detect based on available API keys
   openai_model: "text-embedding-3-small"
-  local_model: "sentence-transformers/all-MiniLM-L6-v2"
+  local_model: "BAAI/bge-base-en-v1.5"  # Embedding model
+  groq_model: "qwen/qwen3-32b"  # Groq model to use for embeddings (e.g., "qwen/qwen3-32b", "llama-3.3-70b-versatile")
+  reranker_enabled: true
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-12-v2"  # Reranker model (can be local path like "./models/reranker" or HF model ID)
+  reranker_top_k: 20  # Number of results to rerank
   chunk_size_tokens: 500
   chunk_overlap_tokens: 80
   top_k: 8

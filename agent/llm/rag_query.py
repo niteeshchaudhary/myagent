@@ -83,6 +83,11 @@ class RAGQuery:
     ) -> Dict[str, Any]:
         """
         Run retrieval + (optionally) ask LLM to answer using the grounded prompt.
+        
+        Automatically adjusts for Groq free tier limits (6,000 TPM) by reducing chunks and truncating.
+        """
+        """
+        Run retrieval + (optionally) ask LLM to answer using the grounded prompt.
 
         Args:
           question: user question
@@ -98,21 +103,78 @@ class RAGQuery:
         """
         start = time.time()
         try:
+            # Check if using Groq and adjust retrieval parameters
+            is_groq = False
+            max_tokens = None
+            if self.llm:
+                # Check if LLM is Groq - be precise to avoid false positives with Ollama
+                llm_class_name = self.llm.__class__.__name__ if hasattr(self.llm, "__class__") else ""
+                provider_attr = getattr(self.llm, "provider", None)
+                
+                # Check provider attribute first (most reliable)
+                if provider_attr:
+                    provider_str = str(provider_attr).lower()
+                    if "groq" in provider_str and "ollama" not in provider_str:
+                        is_groq = True
+                
+                # Check class name (GroqLLM is specific)
+                if "GroqLLM" in llm_class_name:
+                    is_groq = True
+                
+                # Check config - but be careful not to match Ollama models
+                if hasattr(self.llm, "config"):
+                    config = self.llm.config
+                    # Check if provider in config is explicitly "groq"
+                    if hasattr(config, "provider") and config.provider and "groq" in str(config.provider).lower():
+                        is_groq = True
+                    # Don't use model name alone - too many false positives with Ollama
+                
+                if is_groq:
+                    # Groq free tier: 6,000 TPM limit, be conservative
+                    max_tokens = 5000  # Leave some headroom
+                    # Reduce k for Groq
+                    if k is None:
+                        k = min(self.cfg.top_k, 3)  # Max 3 chunks for Groq free tier
+                    else:
+                        k = min(k, 3)
+                    logger.info("Detected Groq LLM - reducing chunks to %d and limiting prompt size for free tier compatibility", k)
+            
             # 1) retrieve relevant chunks
             chunks = self.retriever.retrieve(question, k=k, use_hybrid=not prefer_exact)
-            # 2) compose grounded prompt
-            prompt = grounding_prompt(question, chunks, max_chars_per_chunk=self.cfg.max_chunk_chars)
-            # quick sources list
-            sources_list = format_sources_list_for_output(chunks)
+            
+            # 2) compose grounded prompt with token limits if using Groq
+            max_chunk_chars = self.cfg.max_chunk_chars
+            if is_groq:
+                # Reduce chunk size for Groq
+                max_chunk_chars = min(max_chunk_chars, 1500)  # Smaller chunks for Groq
+            
+            prompt = grounding_prompt(
+                question, 
+                chunks, 
+                max_chars_per_chunk=max_chunk_chars,
+                max_total_tokens=max_tokens
+            )
+            # quick sources list (filtered and deduplicated)
+            sources_list_raw = format_sources_list_for_output(chunks)
+            # Convert to string if it's a list, or keep as-is if already a string
+            if isinstance(sources_list_raw, list):
+                sources_list = sources_list_raw
+            else:
+                sources_list = sources_list_raw
 
             # If LLM not requested, return prompt + chunks so caller can inspect
             if not use_llm or self.llm is None:
                 elapsed = time.time() - start
+                # Ensure sources_list is in the right format
+                if isinstance(sources_list, list):
+                    sources_output = sources_list
+                else:
+                    sources_output = sources_list.split("\n") if sources_list else []
                 return {
                     "answer": "",
                     "prompt": prompt,
                     "chunks": chunks,
-                    "sources": sources_list,
+                    "sources": sources_output,
                     "llm_raw": None,
                     "used_llm": False,
                     "elapsed_s": elapsed,
@@ -152,11 +214,68 @@ class RAGQuery:
                 if isinstance(gen, dict):
                     llm_raw = gen
                     answer_text = gen.get("text") or gen.get("output") or ""
+                    # If answer_text is still empty or looks like raw JSON, try to parse it
+                    if not answer_text or (answer_text.strip().startswith("{") and answer_text.strip().startswith("{")):
+                        # Check if it's raw JSON that wasn't parsed
+                        try:
+                            import json
+                            parsed = json.loads(answer_text.strip())
+                            if isinstance(parsed, dict):
+                                answer_text = parsed.get("response") or parsed.get("text") or parsed.get("content") or ""
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            pass
                 else:
-                    # could be raw string
-                    llm_raw = {"text": str(gen)}
-                    answer_text = str(gen)
+                    # could be raw string - check if it's JSON
+                    raw_str = str(gen)
+                    try:
+                        import json
+                        parsed = json.loads(raw_str.strip())
+                        if isinstance(parsed, dict):
+                            answer_text = parsed.get("response") or parsed.get("text") or parsed.get("content") or ""
+                            llm_raw = {"text": answer_text, "raw": raw_str}
+                        else:
+                            llm_raw = {"text": raw_str}
+                            answer_text = raw_str
+                    except (json.JSONDecodeError, ValueError):
+                        llm_raw = {"text": raw_str}
+                        answer_text = raw_str
 
+            # Final cleanup: ensure answer_text doesn't contain raw JSON
+            # If it looks like JSON, try to extract text from it
+            if answer_text and answer_text.strip().startswith("{"):
+                # Check if it's a single JSON object or multiple JSON lines
+                lines = answer_text.strip().split("\n")
+                cleaned_text = ""
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("{"):
+                        try:
+                            import json
+                            parsed = json.loads(line)
+                            if isinstance(parsed, dict):
+                                # Extract text from JSON
+                                text = parsed.get("response") or parsed.get("text") or parsed.get("content") or ""
+                                if text:
+                                    cleaned_text += text
+                        except (json.JSONDecodeError, ValueError):
+                            # Not valid JSON, keep as-is
+                            cleaned_text += line + "\n"
+                    else:
+                        cleaned_text += line + "\n"
+                if cleaned_text.strip():
+                    answer_text = cleaned_text.strip()
+            
+            # Remove SOURCES section from answer if LLM included it (we'll show it separately)
+            if answer_text:
+                # Look for SOURCES: or === SOURCES === patterns and remove them
+                import re
+                # Remove SOURCES section that might be in the answer
+                answer_text = re.sub(r'\n\s*===?\s*SOURCES?\s*===?\s*\n.*', '', answer_text, flags=re.DOTALL | re.IGNORECASE)
+                answer_text = re.sub(r'\n\s*SOURCES?:\s*\n.*', '', answer_text, flags=re.DOTALL | re.IGNORECASE)
+                answer_text = answer_text.strip()
+            
             elapsed = time.time() - start
             return {
                 "answer": answer_text,

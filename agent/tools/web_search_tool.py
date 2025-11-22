@@ -3,7 +3,9 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from utils.logger import logger
+from agent.utils.logger import get_logger
+
+logger = get_logger(__name__)
 import time
 
 class WebSearchTool:

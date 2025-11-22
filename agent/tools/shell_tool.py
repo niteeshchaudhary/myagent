@@ -19,6 +19,16 @@ class ShellTool:
     name = "shell"
     description = "Execute shell commands with user confirmation"
     
+    # Configurable attributes (can be set from tools.yaml)
+    allow_all_commands: bool = False
+    blocked: list = None
+    timeout_sec: int = 60
+    
+    def __init__(self):
+        """Initialize with default values"""
+        if self.blocked is None:
+            self.blocked = []
+    
     # Commands that are typically long-running servers/processes
     LONG_RUNNING_KEYWORDS = [
         "npm start", "npm run dev", "npm run serve",
@@ -31,6 +41,18 @@ class ShellTool:
         "go run", "cargo run",
         "docker run", "docker-compose up",
         "serve", "http-server", "live-server"
+    ]
+    
+    # Commands that require interactive user input
+    INTERACTIVE_KEYWORDS = [
+        "npm create", "npx create", "yarn create", "pnpm create",
+        "create-react-app", "create-vite", "create-next-app",
+        "npm init", "yarn init", "pnpm init",
+        "git init", "git clone",
+        "docker run -it", "docker exec -it",
+        "python -i", "python -m ipython",
+        "mysql", "psql", "sqlite3",
+        "passwd", "adduser", "useradd",
     ]
     
     # Success indicators for long-running processes
@@ -57,6 +79,11 @@ class ShellTool:
         cmd_lower = cmd.lower()
         return any(keyword in cmd_lower for keyword in self.LONG_RUNNING_KEYWORDS)
     
+    def _is_interactive(self, cmd: str) -> bool:
+        """Check if a command requires interactive user input."""
+        cmd_lower = cmd.lower()
+        return any(keyword in cmd_lower for keyword in self.INTERACTIVE_KEYWORDS)
+    
     def run(self, input_data, **kwargs):
         """
         Execute shell command with confirmation.
@@ -69,18 +96,31 @@ class ShellTool:
         if isinstance(input_data, dict):
             cmd = input_data.get("command") or input_data.get("cmd") or str(input_data.get("input", ""))
             background = input_data.get("background", False)
-            timeout = input_data.get("timeout", 10.0)  # Default 10 seconds for monitoring
+            timeout = input_data.get("timeout", getattr(self, 'timeout_sec', 60))  # Use configured timeout or default
         else:
             cmd = str(input_data)
             background = False
-            timeout = 10.0
+            timeout = getattr(self, 'timeout_sec', 60)  # Use configured timeout or default
         
         if not cmd or not cmd.strip():
             raise ValueError("Shell tool expects a non-empty command.")
         
+        # Check if command is blocked
+        blocked_commands = getattr(self, 'blocked', [])
+        if blocked_commands:
+            cmd_lower = cmd.lower()
+            for blocked in blocked_commands:
+                if blocked.lower() in cmd_lower:
+                    return {"output": f"Command blocked by configuration: {blocked}", "success": False, "error": "blocked_command"}
+        
+        # Check if this is an interactive command
+        is_interactive = self._is_interactive(cmd)
+        
         # Ask for confirmation if running interactively
         if sys.stdin and sys.stdin.isatty():
             print(f"\n[Shell] Command: {cmd}")
+            if is_interactive:
+                print("[Shell] This command requires interactive input. You will be able to provide input in the terminal.")
             response = input("Would you like to execute this command? (Y/n): ").strip().lower()
             if response and response not in ('y', 'yes', ''):
                 return {"output": "Command execution cancelled by user.", "cancelled": True}
@@ -90,7 +130,10 @@ class ShellTool:
         
         # Execute the command
         try:
-            if is_long_running:
+            if is_interactive:
+                # Interactive commands need to run with terminal I/O
+                result = run_shell_interactive(cmd)
+            elif is_long_running:
                 result = run_shell_background(cmd, timeout=timeout, 
                                             success_indicators=self.SUCCESS_INDICATORS,
                                             error_indicators=self.ERROR_INDICATORS)
@@ -103,6 +146,78 @@ class ShellTool:
             return {"output": result, "success": True}
         except Exception as e:
             return {"output": "", "success": False, "error": str(e)}
+
+
+def run_shell_interactive(cmd: str) -> Dict[str, Any]:
+    """
+    Execute an interactive shell command with terminal I/O connected.
+    
+    This allows the user to interact with commands that require input
+    (like npm create vite, npx create-react-app, etc.).
+    
+    Input:
+        "npm create vite@latest"
+        
+    Returns:
+        Dict with 'output', 'success', and optional 'error'
+    """
+    if not isinstance(cmd, str):
+        raise ValueError("Shell tool expects a string command.")
+    
+    log.info(f"[shell] Running interactive command: {cmd}")
+    
+    # Check if we're in a TTY (terminal)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        log.warning("[shell] Not running in a TTY - interactive mode may not work properly")
+        # Fall back to non-interactive mode
+        try:
+            result = run_shell(cmd)
+            return {"output": result, "success": True}
+        except Exception as e:
+            return {"output": "", "success": False, "error": str(e)}
+    
+    # Run command with stdin/stdout/stderr connected to terminal
+    # This allows the user to interact with the command
+    try:
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdin=sys.stdin,  # Connect to terminal stdin
+            stdout=sys.stdout,  # Connect to terminal stdout
+            stderr=sys.stderr,  # Connect to terminal stderr
+            text=True
+        )
+        
+        # Wait for the process to complete
+        return_code = process.wait()
+        
+        if return_code != 0:
+            return {
+                "output": f"Command exited with code {return_code}",
+                "success": False,
+                "error": f"Process exited with return code {return_code}"
+            }
+        
+        return {
+            "output": "Interactive command completed successfully",
+            "success": True,
+            "message": "Command completed - user interaction was handled in terminal"
+        }
+    except KeyboardInterrupt:
+        log.info("[shell] Command interrupted by user")
+        return {
+            "output": "Command interrupted by user",
+            "success": False,
+            "error": "User interrupted the command",
+            "cancelled": True
+        }
+    except Exception as e:
+        log.exception("[shell] Error running interactive command")
+        return {
+            "output": "",
+            "success": False,
+            "error": str(e)
+        }
 
 
 def run_shell(cmd: str) -> str:

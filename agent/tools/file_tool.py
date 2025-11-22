@@ -1,272 +1,323 @@
+# file_tool.py
+"""
+Robust file tool with diff-first behavior.
+
+Provides:
+- read(path)
+- write(path, content, author=None, dry_run=False, make_dirs=True)
+- delete(path, dry_run=False)
+- list_dir(path)
+- exists(path)
+- handle(request_dict)  # convenience entrypoint used by tool managers
+
+Behavior:
+- If writing to an existing file, compute a unified diff between current and new content.
+  Attempt to apply the unified diff via the repo patcher (apply_unified_diff).
+  If that succeeds, report "patched". If it fails, fall back to an atomic file write and report the reason.
+- Uses UTF-8 everywhere and atomic replace (write to tmp -> os.replace).
+- Returns structured dicts: {"ok": bool, "action": str, "path": str, "message": str, "meta": {...}}
+"""
+
+from __future__ import annotations
 import os
-from agent.utils.logger import log
-from agent.utils.change_tracker import get_change_tracker
+import io
+import difflib
+import tempfile
+import shutil
+import logging
+from typing import Optional, Dict, Any, List, Tuple
+
+logger = logging.getLogger("file_tool")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(ch)
 
 
-class FileTool:
+# Try to import the project's patcher (preferred). Fall back gracefully.
+_apply_unified_diff = None  # type: Optional[callable]
+try:
+    # project layout may differ; prefer canonical import if available
+    from agent.core.patcher import apply_unified_diff as _apply_unified_diff  # type: ignore
+    logger.debug("Imported agent.core.patcher.apply_unified_diff")
+except Exception:
+    try:
+        # fallback to local module if present at top-level (e.g., patcher.py)
+        from patcher import apply_unified_diff as _apply_unified_diff  # type: ignore
+        logger.debug("Imported local patcher.apply_unified_diff")
+    except Exception:
+        _apply_unified_diff = None
+        logger.debug("No patcher.apply_unified_diff found; will fallback to atomic writes.")
+
+
+def _read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _atomic_write(path: str, content: str) -> None:
+    dirpath = os.path.dirname(path) or "."
+    # ensure directory exists
+    os.makedirs(dirpath, exist_ok=True)
+    # write to temp and replace
+    fd, tmpname = tempfile.mkstemp(dir=dirpath, prefix=".tmp_filetool_", text=True)
+    os.close(fd)  # we'll open using python's io
+    try:
+        with io.open(tmpname, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+        os.replace(tmpname, path)
+    finally:
+        # cleanup if tmp remains
+        if os.path.exists(tmpname):
+            try:
+                os.remove(tmpname)
+            except Exception:
+                pass
+
+
+def _compute_unified_diff(path: str, new_content: str) -> str:
     """
-    File operations tool for reading, writing, and managing files.
-    
-    Supports:
-    - read: Read file contents
-    - write: Write content to file
-    - append: Append content to file
-    - delete: Delete a file
-    - exists: Check if file exists
-    - list: List directory contents
-    - search: Search for keywords in file
+    Compute a git-style unified diff string (no index headers).
+    fromfile/tofile use a/<path> and b/<path> to match git patch style.
     """
-    
-    name = "file"
-    description = "File operations tool for reading, writing, and managing files"
-    
-    def run(self, input_data, **kwargs):
-        """
-        Execute file operation.
-        
-        Input can be:
-        - A dict with 'action' and other fields
-        - A string that will be parsed as action or treated as write action with content
-        """
-        # Check if previous output is available in kwargs (from agent loop)
-        previous_output = kwargs.get("previous_output") or kwargs.get("last_output")
-        
-        # Handle string input - could be a simple write command or JSON
-        if isinstance(input_data, str):
-            # If it looks like a write command, parse it
-            if "Write" in input_data or "write" in input_data or "into" in input_data.lower():
-                # Try to extract file path and content from natural language
-                # Example: "Write the generated C++ code into abc.cpp"
-                import re
-                # Look for "into <filename>" pattern
-                match = re.search(r'into\s+([^\s]+)', input_data, re.IGNORECASE)
-                if match:
-                    filename = match.group(1)
-                    
-                    # Try to extract code from markdown code blocks in the input or previous output
-                    content = ""
-                    
-                    # First, try to extract from markdown code blocks in input_data
-                    code_block_pattern = r'```(?:cpp|c\+\+|c|python|py|javascript|js|java|html|css|json|xml|bash|sh)?\s*\n(.*?)```'
-                    code_matches = re.findall(code_block_pattern, input_data, re.DOTALL)
-                    if code_matches:
-                        # Use the last/largest code block found
-                        content = max(code_matches, key=len).strip()
-                    
-                    # If no code block in input, check previous_output
-                    if not content and previous_output:
-                        if isinstance(previous_output, str):
-                            code_matches = re.findall(code_block_pattern, previous_output, re.DOTALL)
-                            if code_matches:
-                                content = max(code_matches, key=len).strip()
-                        elif isinstance(previous_output, dict):
-                            # Check common output fields
-                            output_text = previous_output.get("output") or previous_output.get("text") or str(previous_output)
-                            code_matches = re.findall(code_block_pattern, output_text, re.DOTALL)
-                            if code_matches:
-                                content = max(code_matches, key=len).strip()
-                    
-                    # If still no content and input mentions "generated code", use previous_output directly
-                    if not content and ("generated" in input_data.lower() or "code" in input_data.lower()):
-                        if previous_output:
-                            if isinstance(previous_output, str):
-                                content = previous_output
-                            elif isinstance(previous_output, dict):
-                                content = previous_output.get("output") or previous_output.get("text") or str(previous_output)
-                    
-                    # If still no content, try to extract from the input string itself
-                    if not content:
-                        # Remove the command part and see if there's any code left
-                        remaining = input_data.replace(f"into {filename}", "").replace("Write", "").replace("write", "").replace("the generated", "").replace("generated", "").strip()
-                        if remaining and len(remaining) > 20:  # Only use if substantial content
-                            content = remaining
-                    
-                    input_data = {
-                        "action": "write",
-                        "path": filename,
-                        "content": content or ""
-                    }
-                else:
-                    # Fallback: treat as action name
-                    input_data = {"action": input_data}
-            else:
-                # Try to parse as JSON
+    try:
+        old_text = _read_text_file(path)
+    except FileNotFoundError:
+        old_lines: List[str] = []
+    else:
+        old_lines = old_text.splitlines(keepends=False)
+    new_lines = new_content.splitlines(keepends=False)
+    diff_lines = list(difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm=""
+    ))
+    return "\n".join(diff_lines)
+
+
+def read(path: str) -> Dict[str, Any]:
+    try:
+        content = _read_text_file(path)
+        return {"ok": True, "action": "read", "path": path, "content": content}
+    except FileNotFoundError:
+        return {"ok": False, "action": "read", "path": path, "message": "file not found"}
+    except Exception as e:
+        logger.exception("Error reading file %s", path)
+        return {"ok": False, "action": "read", "path": path, "message": str(e)}
+
+
+def exists(path: str) -> bool:
+    return os.path.exists(path)
+
+
+def list_dir(path: str) -> Dict[str, Any]:
+    try:
+        entries = os.listdir(path)
+        return {"ok": True, "action": "list", "path": path, "entries": entries}
+    except FileNotFoundError:
+        return {"ok": False, "action": "list", "path": path, "message": "dir not found"}
+    except Exception as e:
+        logger.exception("Error listing dir %s", path)
+        return {"ok": False, "action": "list", "path": path, "message": str(e)}
+
+
+def delete(path: str, dry_run: bool = False) -> Dict[str, Any]:
+    if dry_run:
+        return {"ok": True, "action": "delete", "path": path, "message": "dry_run - not deleting"}
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        return {"ok": True, "action": "delete", "path": path, "message": "deleted"}
+    except FileNotFoundError:
+        return {"ok": False, "action": "delete", "path": path, "message": "file not found"}
+    except Exception as e:
+        logger.exception("Error deleting %s", path)
+        return {"ok": False, "action": "delete", "path": path, "message": str(e)}
+
+
+def write(
+    path: str,
+    content: str,
+    *,
+    author: Optional[str] = None,
+    dry_run: bool = False,
+    make_dirs: bool = True,
+    prefer_patch: bool = True,
+    repo_root: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Write content to path using diff-first approach.
+
+    Args:
+      path: filesystem path (relative or absolute)
+      content: the new file contents (UTF-8)
+      author: optional metadata string
+      dry_run: if True, do not modify filesystem; report what would be done
+      make_dirs: create parent directories if needed
+      prefer_patch: if True and file exists, attempt to apply unified diff via patcher
+      repo_root: optional repo root to pass to patcher.apply_unified_diff
+
+    Returns:
+      dict with keys: ok (bool), action (patched/wrote/no-op/failed), path, message, meta
+    """
+    meta: Dict[str, Any] = {"author": author}
+    path_exists = os.path.exists(path)
+
+    if path_exists:
+        # compare contents
+        try:
+            old_text = _read_text_file(path)
+        except Exception as e:
+            logger.exception("Failed to read existing file %s", path)
+            old_text = None
+
+        if old_text is not None and old_text == content:
+            return {"ok": True, "action": "no-op", "path": path, "message": "content identical", "meta": meta}
+
+        # produce unified diff
+        diff_text = _compute_unified_diff(path, content)
+        meta["diff"] = diff_text
+
+        if dry_run:
+            return {"ok": True, "action": "dry-run", "path": path, "message": "would patch", "meta": meta}
+
+        # attempt to apply unified diff via patcher if available and prefer_patch True
+        if prefer_patch and _apply_unified_diff is not None:
+            try:
+                # apply_unified_diff is expected to return (ok: bool, report: str) or raise
+                # adapt to both styles
                 try:
-                    import json
-                    input_data = json.loads(input_data)
-                except:
-                    # If not JSON, treat as action name
-                    input_data = {"action": input_data}
-        
-        if not isinstance(input_data, dict):
-            raise ValueError("File tool expects a dict input.")
-        
-        return file_tool(input_data)
+                    result = _apply_unified_diff(diff_text, repo_root=repo_root or ".")
+                    if isinstance(result, tuple):
+                        ok, report = result
+                    elif isinstance(result, dict):
+                        ok = result.get("ok", False)
+                        report = result.get("report", str(result))
+                    else:
+                        # unknown but truthy
+                        ok, report = (True, str(result))
+                except TypeError:
+                    # maybe function signature does not accept repo_root
+                    result = _apply_unified_diff(diff_text)
+                    if isinstance(result, tuple):
+                        ok, report = result
+                    elif isinstance(result, dict):
+                        ok = result.get("ok", False)
+                        report = result.get("report", str(result))
+                    else:
+                        ok, report = (True, str(result))
+
+                if ok:
+                    return {"ok": True, "action": "patched", "path": path, "message": "applied unified diff", "meta": meta}
+                else:
+                    # patcher reported failure; fall through to fallback write
+                    meta["patcher_report"] = report
+                    logger.warning("Patcher failed for %s: %s", path, report)
+            except Exception as e:
+                logger.exception("Exception while applying unified diff for %s", path)
+                meta["patcher_exception"] = str(e)
+                # fall through to fallback atomic write
+
+        # fallback: atomic write (create backup first)
+        try:
+            # backup existing file
+            backup_path = f"{path}.bak"
+            try:
+                shutil.copyfile(path, backup_path)
+                meta["backup"] = backup_path
+            except Exception:
+                # non-fatal if backup fails; continue
+                meta["backup_error"] = "backup failed"
+
+            if make_dirs:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+            _atomic_write(path, content)
+            return {"ok": True, "action": "wrote", "path": path, "message": "wrote file (fallback after patch failure)", "meta": meta}
+        except Exception as e:
+            logger.exception("Failed to write file %s", path)
+            return {"ok": False, "action": "failed", "path": path, "message": str(e), "meta": meta}
+
+    else:
+        # file does not exist -> create new file
+        if dry_run:
+            diff_text = _compute_unified_diff(path, content)
+            meta["diff"] = diff_text
+            return {"ok": True, "action": "dry-run-create", "path": path, "message": "would create new file", "meta": meta}
+
+        try:
+            if make_dirs:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            _atomic_write(path, content)
+            return {"ok": True, "action": "created", "path": path, "message": "created new file", "meta": meta}
+        except Exception as e:
+            logger.exception("Failed to create file %s", path)
+            return {"ok": False, "action": "failed", "path": path, "message": str(e), "meta": meta}
 
 
-# Also create an alias class for file_editor
-class FileEditorTool(FileTool):
-    """Alias for FileTool to support 'file_editor' tool name."""
-    name = "file_editor"
-
-
-def file_tool(action: dict):
+def handle(request: Dict[str, Any]) -> Dict[str, Any]:
     """
-    General file tool.
-    
-    Input:
-        {
-            "action": "read",
-            "path": "test.txt"
-        }
-    
-    Supported actions:
-        - read
-        - write
-        - append
-        - delete
-        - exists
-        - list
-        - search
+    Convenience entrypoint. Expected request dict examples:
+      {"action":"write","path":"src/foo.py","content":"...","dry_run":False}
+      {"action":"read","path":"src/foo.py"}
+      {"action":"list","path":"src"}
+      {"action":"delete","path":"tmp","dry_run":True}
+      {"action":"exists","path":"src/foo.py"}
+
+    Returns structured dict result.
     """
+    action = request.get("action")
+    path = request.get("path")
+    if not action or not path:
+        return {"ok": False, "message": "missing action or path", "request": request}
 
-    if not isinstance(action, dict):
-        raise ValueError("File tool expects a dict input.")
+    action = action.lower()
+    if action == "read":
+        return read(path)
+    if action == "exists":
+        return {"ok": True, "action": "exists", "path": path, "exists": exists(path)}
+    if action == "list":
+        return list_dir(path)
+    if action == "delete":
+        return delete(path, dry_run=bool(request.get("dry_run", False)))
+    if action == "write":
+        content = request.get("content", "")
+        return write(
+            path,
+            content,
+            author=request.get("author"),
+            dry_run=bool(request.get("dry_run", False)),
+            make_dirs=bool(request.get("make_dirs", True)),
+            prefer_patch=bool(request.get("prefer_patch", True)),
+            repo_root=request.get("repo_root"),
+        )
 
-    act = action.get("action")
-    path = action.get("path")
+    return {"ok": False, "message": f"unknown action: {action}", "request": request}
 
-    if act in ["read", "write", "append", "delete", "search"] and not path:
-        raise ValueError("Path is required for this action.")
 
-    log.info(f"[file] Action: {act}, Path: {path}")
+# If run as a script, provide a tiny CLI for ad-hoc testing
+if __name__ == "__main__":
+    import argparse
+    import json
+    ap = argparse.ArgumentParser()
+    ap.add_argument("action", choices=["read", "write", "list", "delete", "exists"])
+    ap.add_argument("path")
+    ap.add_argument("--content", help="content for writes", default=None)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print json result")
+    args = ap.parse_args()
 
-    # ---------------------------------------------------------
-    # READ FILE
-    # ---------------------------------------------------------
-    if act == "read":
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"File not found: {path}")
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+    req = {"action": args.action, "path": args.path, "dry_run": args.dry_run}
+    if args.content is not None:
+        req["content"] = args.content
 
-    # ---------------------------------------------------------
-    # WRITE FILE
-    # ---------------------------------------------------------
-    if act == "write":
-        content = action.get("content", "")
-        # Track changes: snapshot before modification
-        tracker = get_change_tracker()
-        tracker.snapshot_file(path)
-        
-        # Check if in review mode
-        is_pending = tracker._review_mode if hasattr(tracker, '_review_mode') else False
-        
-        if is_pending:
-            # Store as pending change (don't write yet)
-            tracker.record_change(path, new_content=content, pending=True)
-            return f"Change to {path} stored as pending (awaiting review)."
-        else:
-            # Create parent directories if they don't exist
-            dir_path = os.path.dirname(path)
-            if dir_path and not os.path.exists(dir_path):
-                os.makedirs(dir_path, exist_ok=True)
-                log.info(f"[file] Created directory: {dir_path}")
-            
-            # Write immediately
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            
-            # Record the change
-            tracker.record_change(path, new_content=content, pending=False)
-            
-            return "File written successfully."
-
-    # ---------------------------------------------------------
-    # APPEND FILE
-    # ---------------------------------------------------------
-    if act == "append":
-        content = action.get("content", "")
-        # Track changes: snapshot before modification
-        tracker = get_change_tracker()
-        tracker.snapshot_file(path)
-        
-        # Check if in review mode
-        is_pending = tracker._review_mode if hasattr(tracker, '_review_mode') else False
-        
-        if is_pending:
-            # For append, we need to read current content and append to it
-            old_content = tracker._file_snapshots.get(path, "")
-            new_content = (old_content or "") + content
-            tracker.record_change(path, new_content=new_content, pending=True)
-            return f"Append to {path} stored as pending (awaiting review)."
-        else:
-            # Create parent directories if they don't exist
-            dir_path = os.path.dirname(path)
-            if dir_path and not os.path.exists(dir_path):
-                os.makedirs(dir_path, exist_ok=True)
-                log.info(f"[file] Created directory: {dir_path}")
-            
-            # Write immediately
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(content)
-            
-            # Record the change (read full file to get new content)
-            tracker.record_change(path, pending=False)
-            
-            return "Content appended successfully."
-
-    # ---------------------------------------------------------
-    # DELETE FILE
-    # ---------------------------------------------------------
-    if act == "delete":
-        # Track changes: snapshot before deletion
-        tracker = get_change_tracker()
-        tracker.snapshot_file(path)
-        
-        # Check if in review mode
-        is_pending = tracker._review_mode if hasattr(tracker, '_review_mode') else False
-        
-        if is_pending:
-            # Store as pending deletion
-            tracker.record_change(path, new_content=None, pending=True)
-            return f"Deletion of {path} stored as pending (awaiting review)."
-        else:
-            if os.path.exists(path):
-                os.remove(path)
-                # Record deletion
-                tracker.record_change(path, new_content=None, pending=False)
-                return "File deleted."
-            return "File does not exist."
-
-    # ---------------------------------------------------------
-    # EXISTS
-    # ---------------------------------------------------------
-    if act == "exists":
-        return os.path.exists(path)
-
-    # ---------------------------------------------------------
-    # LIST DIRECTORY
-    # ---------------------------------------------------------
-    if act == "list":
-        directory = action.get("directory", ".")
-        return os.listdir(directory)
-
-    # ---------------------------------------------------------
-    # SEARCH INSIDE FILE
-    # ---------------------------------------------------------
-    if act == "search":
-        keyword = action.get("keyword")
-        if not keyword:
-            raise ValueError("Missing 'keyword' for search action.")
-
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"File not found: {path}")
-
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        matches = [line.strip() for line in lines if keyword in line]
-        return matches
-
-    raise ValueError(f"Unsupported file action: {act}")
+    result = handle(req)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(result.get("message") or result)

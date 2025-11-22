@@ -373,12 +373,16 @@ class CodeValidator:
                     break
 
         # If we reach here, either no llm, or fixes didn't work
-        if auto_rollback and original_head:
-            logger.info("Attempting rollback to original HEAD %s", original_head)
+        # Only rollback if we actually attempted fixes and they failed
+        # Don't rollback on dry-run (when attempt_fix=False) - we just want to check status
+        if auto_rollback and original_head and attempt_fix:
+            logger.info("Attempting rollback to original HEAD %s (fixes were attempted but failed)", original_head)
             ok_rb, rb_out = self.rollback_to(original_head)
             if ok_rb:
                 logger.info("Rollback succeeded.")
             else:
                 logger.warning("Rollback failed: %s", rb_out)
+        elif auto_rollback and not attempt_fix:
+            logger.debug("Skipping rollback - this is a dry-run (attempt_fix=False). Files will not be rolled back.")
         res.applied_patch = applied_patch_text
         return res

@@ -140,6 +140,32 @@ class Retriever:
             # attempt to lazy-build tags on demand; do not build in constructor
         except Exception:
             self.tags = None
+        # reranker model (lazy load)
+        self.reranker_model = None
+        if self.cfg.reranker.enabled:
+            try:
+                from sentence_transformers import CrossEncoder
+                model_path = self.cfg.reranker.model
+                
+                # Check if it's a local path
+                if os.path.exists(model_path) and os.path.isdir(model_path):
+                    # Load from local directory
+                    logger.info("Loading reranker model from local path: %s", model_path)
+                    self.reranker_model = CrossEncoder(model_path)
+                else:
+                    # Try to load from Hugging Face (will cache locally on first use)
+                    # Check for Hugging Face token in environment
+                    hf_token = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+                    if hf_token:
+                        self.reranker_model = CrossEncoder(model_path, token=hf_token)
+                    else:
+                        # Try without token - most public models work without authentication
+                        self.reranker_model = CrossEncoder(model_path)
+                    logger.info("Loaded reranker model: %s", model_path)
+            except Exception as e:
+                logger.warning("Failed to load reranker model '%s': %s. Reranking will be disabled.", self.cfg.reranker.model, e)
+                logger.info("Tip: You can download the model locally using: python -m agent.rag.download_reranker")
+                self.reranker_model = None
 
     # -------------------------
     # High-level retrieve API
@@ -319,6 +345,27 @@ class Retriever:
             logger.warning("Vector store or embedder not initialized; returning empty semantic results.")
             return []
 
+        # Check if index exists
+        if hasattr(self.vstore, 'index_path') and self.vstore.index_path:
+            index_path = self.vstore.index_path
+        else:
+            index_path = getattr(self.cfg.vectorstore, 'index_path', '.agent_index')
+        
+        # Check if index exists (look for meta.json or vectors.index)
+        import os
+        index_exists = (
+            os.path.exists(os.path.join(index_path, "meta.json")) or
+            os.path.exists(os.path.join(index_path, "vectors.index")) or
+            (hasattr(self.vstore, '_meta') and len(self.vstore._meta) > 0)
+        )
+        
+        if not index_exists:
+            logger.warning(
+                f"Codebase index not found at {index_path}. "
+                f"Semantic search will return empty results. "
+                f"To index your codebase, run: agent index (from the repository root: {self.cfg.repo_root})"
+            )
+
         # embed the query
         try:
             vecs = self.embedder.embed_texts([query])
@@ -329,9 +376,10 @@ class Retriever:
             logger.exception("Embedding query failed; falling back to simple empty list.")
             return []
 
-        # query vector store
+        # query vector store - retrieve more candidates if reranking is enabled
+        retrieve_k = self.cfg.reranker.top_k if (self.cfg.reranker.enabled and self.reranker_model) else k * 2
         try:
-            hits = self.vstore.query(vec, top_k=k * 2)  # request a margin for reranking
+            hits = self.vstore.query(vec, top_k=retrieve_k)
         except Exception:
             logger.exception("Vector store query failed.")
             hits = []
@@ -362,13 +410,19 @@ class Retriever:
 
     def _rerank_semantic_results(self, results: List[Dict], query: str, top_k: int = 8) -> List[Dict]:
         """
-        Blend vector score and lexical overlap. Vector scores may be cosine similarity in [0,1]
-        (FAISS normalized) or dot-product-like values.
-        We compute a blended score = alpha * normalized_vector + (1-alpha) * overlap_score.
-        Normalize vector scores to [0,1] by min/max in results.
+        Rerank semantic results using cross-encoder reranker if available, otherwise use lexical overlap.
         """
         if not results:
             return []
+        
+        # Use cross-encoder reranker if available and enabled
+        if self.reranker_model and self.cfg.reranker.enabled:
+            try:
+                return self._rerank_with_cross_encoder(results, query, top_k)
+            except Exception as e:
+                logger.warning("Cross-encoder reranking failed, falling back to lexical: %s", e)
+        
+        # Fallback: blend vector score and lexical overlap
         vec_scores = [r.get("score", 0.0) for r in results]
         min_s = min(vec_scores)
         max_s = max(vec_scores)
@@ -385,6 +439,37 @@ class Retriever:
         scored.sort(key=lambda x: x[0], reverse=True)
         top = [r for _, r in scored[:top_k]]
         return top
+
+    def _rerank_with_cross_encoder(self, results: List[Dict], query: str, top_k: int) -> List[Dict]:
+        """
+        Rerank results using a cross-encoder reranker model.
+        This provides better relevance scoring than simple lexical overlap.
+        """
+        if not self.reranker_model:
+            return results[:top_k]
+        
+        # Prepare query-document pairs for reranking
+        pairs = [[query, r.get("text", "")] for r in results]
+        
+        # Get reranker scores
+        try:
+            scores = self.reranker_model.predict(pairs)
+            # scores is a numpy array or list of scores
+            if hasattr(scores, 'tolist'):
+                scores = scores.tolist()
+            
+            # Update results with reranker scores
+            scored: List[Tuple[float, Dict]] = []
+            for r, score in zip(results, scores):
+                r["score"] = float(score)
+                scored.append((float(score), r))
+            
+            # Sort by reranker score (descending)
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [r for _, r in scored[:top_k]]
+        except Exception as e:
+            logger.exception("Error during cross-encoder reranking: %s", e)
+            return results[:top_k]
 
     # -------------------------
     # Merge exact + semantic results

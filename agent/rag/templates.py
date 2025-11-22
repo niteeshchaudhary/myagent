@@ -68,6 +68,7 @@ def grounding_prompt(
     *,
     max_chars_per_chunk: int = 3000,
     instructions: Optional[List[str]] = None,
+    max_total_tokens: Optional[int] = None,
 ) -> str:
     """
     Compose a grounded prompt for answering a question about the repo.
@@ -84,9 +85,29 @@ def grounding_prompt(
     lines.append("")  # spacer
 
     # Group chunks by source_type for readability
-    exacts = [c for c in chunks if c.get("source_type") == "exact"]
-    sems = [c for c in chunks if c.get("source_type") == "semantic"]
-    files = [c for c in chunks if c.get("source_type") == "file_expansion"]
+    chunks_list = list(chunks)
+    exacts = [c for c in chunks_list if c.get("source_type") == "exact"]
+    sems = [c for c in chunks_list if c.get("source_type") == "semantic"]
+    files = [c for c in chunks_list if c.get("source_type") == "file_expansion"]
+    
+    # If max_total_tokens is set (e.g., for Groq free tier), limit chunks and truncate more aggressively
+    if max_total_tokens:
+        # Estimate tokens: ~4 chars per token, reserve ~500 tokens for instructions/question
+        available_tokens = max_total_tokens - 500
+        available_chars = available_tokens * 4
+        
+        # Reduce max_chars_per_chunk if needed
+        total_chunks = len(exacts) + len(sems) + len(files)
+        if total_chunks > 0:
+            max_per_chunk = min(max_chars_per_chunk, available_chars // total_chunks)
+            max_chars_per_chunk = max(500, max_per_chunk)  # Minimum 500 chars per chunk
+        
+        # Limit number of chunks if still too many
+        if len(exacts) + len(sems) + len(files) > 5:
+            # Keep top 3 exact, top 2 semantic
+            exacts = exacts[:3]
+            sems = sems[:2]
+            files = files[:1]
 
     if exacts:
         lines.append(_format_header("EXACT SOURCES"))
@@ -238,19 +259,37 @@ def answer_with_sources_constraints() -> str:
 
 
 # ---- tiny utilities helpful to other modules ----
-def format_sources_list_for_output(chunks: Iterable[Dict]) -> str:
+def format_sources_list_for_output(chunks: Iterable[Dict]) -> List[str]:
     """
     Given retrieved chunks, produce a short numbered sources list suitable to append to an LLM answer.
     Each line looks like: "- path: start-end (semantic/exact)"
+    
+    Returns a list of source strings (deduplicated, log files filtered out).
     """
+    seen = set()  # Track (path, start_line, end_line) tuples to deduplicate
     out = []
+    
     for c in chunks:
         p = c.get("path") or "<unknown>"
+        
+        # Filter out log files
+        if "/logs/" in p or p.endswith(".log") or "logs/" in p:
+            continue
+        
         sl = c.get("start_line")
         el = c.get("end_line")
         st = c.get("source_type") or "semantic"
+        
+        # Create a unique key for deduplication
+        key = (p, sl, el)
+        if key in seen:
+            continue
+        seen.add(key)
+        
+        # Format the source line
         if sl or el:
             out.append(f"- {p} lines {sl or '?'}-{el or '?'} ({st})")
         else:
             out.append(f"- {p} ({st})")
-    return "\n".join(out)
+    
+    return out

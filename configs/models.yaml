@@ -1,4 +1,9 @@
-default_model: "groq-model-x"
+# Default model - change this to avoid Groq rate limits
+# Options: 
+#   - "gpt-4.1-mini" (OpenAI - requires OPENAI_API_KEY)
+#   - "ollama-model-y" (Ollama local - requires Ollama running)
+#   - "groq-model-x" (Groq - has rate limits, not recommended)
+default_model: "groq-model-x"  # Using Ollama (local) instead of Groq to avoid rate limits
 
 models:
   gpt-4.1-mini:

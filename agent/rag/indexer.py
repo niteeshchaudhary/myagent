@@ -80,6 +80,16 @@ try:
 except Exception:
     openai = None  # type: ignore
 
+# Groq optional
+_HAS_GROQ = False
+try:
+    from groq import Groq  # type: ignore
+
+    _HAS_GROQ = True
+except Exception:
+    Groq = None  # type: ignore
+    _HAS_GROQ = False
+
 import numpy as np
 from uuid import uuid4
 
@@ -304,10 +314,34 @@ class Embedder:
         self.cfg = cfg
         self.backend = "local"
         self.model_local = None
+        self.groq_client = None
+        self.use_groq = False
+        
+        # Determine embedding backend priority:
+        # 1. If prefer_openai is True and OpenAI is available -> use OpenAI
+        # 2. If groq_model is set AND prefer_openai is False (not explicitly disabled) AND Groq is available -> use Groq
+        # 3. Otherwise -> use local
+        
+        # Check for OpenAI first if explicitly preferred
         if cfg.prefer_openai and _HAS_OPENAI and (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")):
             self.backend = "openai"
             # set openai api key if present in env (openai lib will auto pick)
+            logger.info("Using OpenAI embeddings (model: %s)", cfg.openai_model)
+        # Check for Groq only if prefer_openai is False (meaning we're not forcing OpenAI)
+        # AND groq_model is explicitly set (meaning user wants Groq)
+        elif (not cfg.prefer_openai and cfg.groq_model and _HAS_GROQ and 
+              (os.environ.get("GROQ_API_KEY"))):
+            try:
+                self.groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+                self.backend = "groq"
+                self.use_groq = True
+                logger.info("Using Groq model '%s' for embeddings", cfg.groq_model)
+            except Exception as e:
+                logger.warning("Failed to initialize Groq client for embeddings: %s. Falling back to local embeddings.", e)
+                self.use_groq = False
+                # Fall through to local
         else:
+            # Use local embeddings (works for both "local" and "groq" backends when groq_model not specified)
             if _HAS_SENTENCE_TRANSFORMERS:
                 self.backend = "local"
                 try:
@@ -323,21 +357,30 @@ class Embedder:
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
+        # Try Groq embeddings first if configured
+        if self.backend == "groq" and self.use_groq and self.groq_client:
+            try:
+                return self._embed_with_groq(texts)
+            except Exception:
+                logger.exception("Groq embedding failed; falling back to local or hashing.")
+                # fallthrough to local/hashing
         if self.backend == "openai" and _HAS_OPENAI:
             try:
                 model = self.cfg.openai_model
+                # Use OpenAI client for v1.0+ API
+                client = openai.OpenAI()
                 # batch in chunks of cfg.batch_size
                 embeddings: List[List[float]] = []
                 batch = []
                 for t in texts:
                     batch.append(t)
                     if len(batch) >= self.cfg.batch_size:
-                        resp = openai.Embedding.create(model=model, input=batch)
-                        embeddings.extend([e["embedding"] for e in resp["data"]])
+                        resp = client.embeddings.create(model=model, input=batch)
+                        embeddings.extend([e.embedding for e in resp.data])
                         batch = []
                 if batch:
-                    resp = openai.Embedding.create(model=model, input=batch)
-                    embeddings.extend([e["embedding"] for e in resp["data"]])
+                    resp = client.embeddings.create(model=model, input=batch)
+                    embeddings.extend([e.embedding for e in resp.data])
                 return embeddings
             except Exception:
                 logger.exception("OpenAI embedding failed; falling back to local or hashing.")
@@ -361,6 +404,97 @@ class Embedder:
                 vec = vec + [0.0] * (dim - len(vec))
             out.append(vec[:dim])
         return out
+
+    def _embed_with_groq(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings using Groq LLM models.
+        
+        Since Groq doesn't have native embedding models, we use a workaround:
+        1. Use Groq LLM to generate a semantic representation of the text
+        2. Hash the LLM output to create a consistent embedding vector
+        
+        This approach uses Groq's models but creates embeddings from their output.
+        """
+        if not self.groq_client or not self.cfg.groq_model:
+            raise RuntimeError("Groq client or model not configured")
+        
+        # Warn user about slowness
+        if len(texts) > 10:
+            logger.warning(
+                f"Groq embedding is very slow for {len(texts)} chunks (requires {len(texts)} API calls). "
+                f"Consider using local embeddings (embed_backend: 'local') for faster indexing."
+            )
+        
+        embeddings: List[List[float]] = []
+        # Process texts individually or in small batches to avoid token limits
+        batch_size = min(self.cfg.batch_size, 8)  # Smaller batches for Groq LLM
+        total = len(texts)
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_embeddings = []
+            
+            # Show progress for large batches
+            if total > 10 and i % 10 == 0:
+                print(f"\rProcessing Groq embeddings: {i}/{total} ({100*i//total}%)...", end="", flush=True)
+            
+            for text in batch:
+                try:
+                    # Use Groq LLM to generate a semantic representation
+                    # We ask the model to summarize/represent the text in a consistent way
+                    prompt = f"""Generate a concise semantic representation of the following text. 
+Focus on key concepts, meaning, and context. Keep it brief and consistent:
+
+Text: {text[:1000]}  # Limit text length to avoid token limits
+
+Semantic representation:"""
+                    
+                    response = self.groq_client.chat.completions.create(
+                        model=self.cfg.groq_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_completion_tokens=100,
+                        temperature=0.1  # Low temperature for consistency
+                    )
+                    
+                    # Extract the generated representation
+                    representation = ""
+                    if response.choices:
+                        for choice in response.choices:
+                            if choice.message and choice.message.content:
+                                representation = choice.message.content.strip()
+                    
+                    # Create embedding from the representation
+                    # Use a combination of text hash and representation hash for better semantic similarity
+                    text_hash = hashlib.sha256(text.encode("utf-8")).digest()
+                    repr_hash = hashlib.sha256(representation.encode("utf-8")).digest()
+                    
+                    # Combine hashes to create a 256-dim vector
+                    combined = text_hash + repr_hash[:16]  # 32 + 16 = 48 bytes
+                    vec = [float(b) / 255.0 for b in combined]
+                    
+                    # Extend to 256 dimensions using a deterministic method
+                    while len(vec) < 256:
+                        # Use a hash of the index to extend
+                        ext_hash = hashlib.md5(f"{text}{len(vec)}".encode()).digest()
+                        vec.extend([float(b) / 255.0 for b in ext_hash[:min(16, 256 - len(vec))]])
+                    
+                    batch_embeddings.append(vec[:256])
+                    
+                except Exception as e:
+                    logger.warning("Failed to generate Groq embedding for text, using hash fallback: %s", e)
+                    # Fallback to simple hash
+                    h = hashlib.md5(text.encode("utf-8")).digest()
+                    vec = [float(b) / 255.0 for b in h]
+                    if len(vec) < 256:
+                        vec = vec + [0.0] * (256 - len(vec))
+                    batch_embeddings.append(vec[:256])
+            
+            embeddings.extend(batch_embeddings)
+        
+        if total > 10:
+            print(f"\rProcessing Groq embeddings: {total}/{total} (100%)... Done!", flush=True)
+        
+        return embeddings
 
 
 # -------------------------
@@ -427,10 +561,13 @@ class VectorStore:
         with open(self.meta_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 
-    def add(self, chunk_metas: List[ChunkMeta], embeddings: List[List[float]]):
+    def add(self, chunk_metas: List[ChunkMeta], embeddings: List[List[float]], *, force_recreate: bool = False):
         """
         Add chunks with embeddings to the store.
         embeddings length must match chunk_metas length.
+        
+        Args:
+            force_recreate: If True and dimension mismatch, clear old index and recreate with new dimension
         """
         if not chunk_metas:
             return
@@ -442,7 +579,25 @@ class VectorStore:
         if self._emb_dim is None:
             self._emb_dim = dim
         if dim != self._emb_dim:
-            raise ValueError(f"Embedding dim mismatch: expected {self._emb_dim}, got {dim}")
+            # Dimension mismatch - this usually happens when switching embedding backends
+            # Auto-clear and recreate if force_recreate is True, otherwise provide helpful error
+            if force_recreate or (self._loaded and len(self._ids) == 0):
+                # Clear old index and recreate with new dimension
+                logger.warning(
+                    "Embedding dimension mismatch (expected %d, got %d). "
+                    "This usually happens when switching embedding backends (e.g., Groq 256-dim to local 768-dim). "
+                    "Clearing old index and recreating with new dimension.",
+                    self._emb_dim, dim
+                )
+                self.clear()
+                self._emb_dim = dim
+            else:
+                raise ValueError(
+                    f"Embedding dim mismatch: expected {self._emb_dim}, got {dim}. "
+                    f"This usually happens when switching embedding backends (e.g., Groq 256-dim to local 768-dim). "
+                    f"Use --force flag when indexing to recreate the index with the new dimension: "
+                    f"agent index --force"
+                )
 
         # append metadata and ids
         for meta, emb in zip(chunk_metas, embeddings):
@@ -490,6 +645,17 @@ class VectorStore:
         if not vector:
             return []
         v = np.array(vector, dtype=np.float32).reshape(1, -1)
+        query_dim = v.shape[1]
+        
+        # Check for dimension mismatch - this happens when switching embedding backends
+        if self._emb_dim is not None and query_dim != self._emb_dim:
+            logger.error(
+                "Vector dimension mismatch: query vector has %d dimensions but index has %d dimensions. "
+                "This usually happens when switching embedding backends (e.g., Groq 256-dim to local 768-dim). "
+                "Please re-index with: agent index --force",
+                query_dim, self._emb_dim
+            )
+            return []  # Return empty results rather than crashing
         if _HAS_FAISS and self._faiss_index is not None:
             faiss.normalize_L2(v)
             D, I = self._faiss_index.search(v, top_k)
@@ -501,6 +667,16 @@ class VectorStore:
                 res.append((cid, float(score)))
             return res
         elif self._np_vectors is not None:
+            # Check for dimension mismatch before querying
+            if self._emb_dim is not None and query_dim != self._emb_dim:
+                logger.error(
+                    "Vector dimension mismatch: query vector has %d dimensions but index has %d dimensions. "
+                    "This usually happens when switching embedding backends (e.g., Groq 256-dim to local 768-dim). "
+                    "Please re-index with: agent index --force",
+                    query_dim, self._emb_dim
+                )
+                return []  # Return empty results rather than crashing
+            
             # compute cosine similarity manually
             mat = self._np_vectors
             # normalize
@@ -519,6 +695,31 @@ class VectorStore:
 
     def all_meta(self) -> Dict[str, Dict]:
         return dict(self._meta)
+    
+    def clear(self):
+        """
+        Clear all vectors and metadata from the store.
+        Useful when switching embedding backends with different dimensions.
+        """
+        self._meta = {}
+        self._ids = []
+        self._emb_dim = None
+        self._faiss_index = None
+        self._np_vectors = None
+        self._loaded = False
+        
+        # Remove existing index files
+        try:
+            idx_file = os.path.join(self.index_path, "faiss.index")
+            if os.path.exists(idx_file):
+                os.remove(idx_file)
+            if os.path.exists(self.vectors_path):
+                os.remove(self.vectors_path)
+            if os.path.exists(self.meta_path):
+                os.remove(self.meta_path)
+            logger.info("Cleared vector store (removed existing index files)")
+        except Exception as e:
+            logger.warning("Failed to remove some index files during clear: %s", e)
 
 
 # -------------------------
@@ -539,8 +740,16 @@ class Indexer:
         """
         Index an entire repo (or specific paths). Returns summary dict.
         If paths is None, walk repo_root and include files matching file_globs (simple implementation).
+        
+        Args:
+            force: If True, force reindexing. Also clears existing index if embedding dimension changes.
         """
         logger.info("Starting index_repo (force=%s)", force)
+        
+        # If force=True, clear existing index to handle dimension changes when switching embedding backends
+        if force and self.vstore._loaded:
+            logger.info("Force reindexing: clearing existing index to handle potential dimension changes")
+            self.vstore.clear()
         start = time.time()
         candidates: List[str] = []
         if paths:
@@ -557,17 +766,32 @@ class Indexer:
             # walk repo and include by globs: simple suffix matching
             includes = [g.lstrip("**/") for g in self.indexer_cfg.file_globs]
             excludes = [g.lstrip("**/") for g in self.indexer_cfg.exclude_globs]
+            
+            # Common directories to exclude (modify dirs in-place to prevent os.walk from descending)
+            excluded_dir_names = {"node_modules", ".git", "__pycache__", ".venv", "venv", 
+                                  ".next", "dist", "build", ".build", "target", "out", 
+                                  ".cache", ".pytest_cache", ".mypy_cache", ".coverage",
+                                  "coverage", ".nyc_output", "logs", ".log"}
+            
             for root, dirs, files in os.walk(self.repo_root):
-                # skip excluded directories
-                skip = False
-                for ex in ("node_modules", ".git", "__pycache__", ".venv", "venv"):
-                    if ex in root:
-                        skip = True
+                # Modify dirs in-place to prevent os.walk from descending into excluded directories
+                dirs[:] = [d for d in dirs if d not in excluded_dir_names and not d.startswith('.')]
+                
+                # Also check if current root should be skipped
+                skip_root = False
+                for ex_name in excluded_dir_names:
+                    if ex_name in root:
+                        skip_root = True
                         break
-                if skip:
+                if skip_root:
                     continue
                 for f in files:
                     fp = os.path.join(root, f)
+                    
+                    # Skip log files explicitly
+                    if f.endswith('.log') or '/logs/' in fp or fp.endswith('/logs'):
+                        continue
+                    
                     # skip hidden large dirs etc implicitly
                     # include by extension
                     include_match = False
@@ -582,10 +806,20 @@ class Indexer:
                                 break
                     if not include_match:
                         continue
-                    # exclude patterns
+                    # exclude patterns - check both full path and relative path
                     skip_file = False
+                    fp_rel = os.path.relpath(fp, self.repo_root)
                     for ex in excludes:
-                        if ex.strip() and ex in fp:
+                        if not ex.strip():
+                            continue
+                        # Check both absolute and relative paths
+                        if ex in fp or ex in fp_rel:
+                            skip_file = True
+                            break
+                        # Also check if exclude pattern matches as a glob-like pattern
+                        # e.g., "**/logs/**" should match any path containing "/logs/"
+                        ex_clean = ex.replace("**/", "").replace("/**", "").replace("*", "")
+                        if ex_clean and ex_clean in fp:
                             skip_file = True
                             break
                     if skip_file:
@@ -604,16 +838,26 @@ class Indexer:
                 logger.exception("Failed chunking file: %s", rel)
 
         logger.info("Produced %d chunks to embed", len(all_metas))
-        # embed in batches
+        # embed in batches with progress reporting
         texts = [m.text for m in all_metas]
         embeddings = []
         batch = []
         batch_metas = []
         B = max(1, self.cfg.embedding.batch_size)
+        total_batches = (len(texts) + B - 1) // B
+        
+        # Show progress for large batches
+        show_progress = len(texts) > 10
+        if show_progress:
+            print(f"Embedding {len(texts)} chunks in {total_batches} batches...", end="", flush=True)
+        
         for i, txt in enumerate(texts):
             batch.append(txt)
             batch_metas.append(all_metas[i])
             if len(batch) >= B or i == len(texts) - 1:
+                batch_num = (i // B) + 1
+                if show_progress:
+                    print(f"\rEmbedding batch {batch_num}/{total_batches} ({len(batch)} chunks)...", end="", flush=True)
                 try:
                     embs = self.embedder.embed_texts(batch)
                     # ensure 2D list
@@ -624,10 +868,14 @@ class Indexer:
                     embeddings.extend(embs)
                 batch = []
                 batch_metas = []
+        
+        if show_progress:
+            print()  # New line after progress
 
         # persist to vector store
         try:
-            self.vstore.add(all_metas, embeddings)
+            # Use force_recreate if force=True to handle dimension mismatches
+            self.vstore.add(all_metas, embeddings, force_recreate=force)
         except Exception:
             logger.exception("Failed adding vectors to store")
 

@@ -1,32 +1,48 @@
 from agent.utils.logger import log
 
 
-def run_python(code: str):
+class PythonTool:
     """
-    Execute Python code safely inside an isolated scope.
+    Python code execution tool.
     
-    Input:
-        "x = 5\nresult = x * 10"
-    
-    Returns:
-        Locals dictionary containing all variables after execution
-    
-    Raises:
-        Exception on syntax/runtime errors.
+    Executes Python code safely inside an isolated scope.
     """
+    
+    name = "python"
+    description = "Execute Python code safely in an isolated scope"
+    
+    def run(self, input: str, **kwargs) -> dict:
+        """
+        Execute Python code safely inside an isolated scope.
+        
+        Input:
+            "x = 5\nresult = x * 10"
+        
+        Returns:
+            Dict with 'output' key containing the result
+        """
+        if not isinstance(input, str):
+            raise ValueError("Python tool expects a string of code.")
 
-    if not isinstance(code, str):
-        raise ValueError("Python tool expects a string of code.")
+        log.info("[python] Executing code...")
+        log.debug(input)
 
-    log.info("[python] Executing code...")
-    log.debug(code)
+        # Safe empty environment
+        local_vars = {}
 
-    # Safe empty environment
-    local_vars = {}
-
-    try:
-        exec(code, {}, local_vars)
-    except Exception as e:
-        raise Exception(f"Python execution error: {e}")
-
-    return local_vars
+        try:
+            exec(input, {}, local_vars)
+            # Format output - show all variables that were set
+            if local_vars:
+                output_lines = []
+                for var_name, var_value in local_vars.items():
+                    output_lines.append(f"{var_name} = {repr(var_value)}")
+                output = "\n".join(output_lines)
+            else:
+                output = "Code executed successfully (no variables set)"
+            
+            return {"output": output, "success": True, "locals": local_vars}
+        except Exception as e:
+            error_msg = f"Python execution error: {e}"
+            log.error(error_msg)
+            return {"output": "", "success": False, "error": error_msg}

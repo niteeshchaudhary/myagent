@@ -72,9 +72,13 @@ class ToolManager:
         res = tm.run("shell", input="echo hello")
     """
 
-    def __init__(self):
+    def __init__(self, tool_configs: Optional[Dict[str, Any]] = None, mcp_manager: Optional[Any] = None):
         # mapping name -> ToolMeta
         self._tools: Dict[str, ToolMeta] = {}
+        # Tool configurations from tools.yaml
+        self._tool_configs: Dict[str, Any] = tool_configs or {}
+        # MCP manager for external MCP tools
+        self._mcp_manager = mcp_manager
 
     # -----------------------
     # Discovery & registration
@@ -170,10 +174,87 @@ class ToolManager:
                     i += 1
                 logger.info("Name collision for tool '%s'; registering as '%s'", orig_name, canonical_name)
 
+            # Apply tool configuration if available
+            self._apply_tool_config(canonical_name, instance)
+            
             self.register_tool(canonical_name, instance, module=modname, cls_name=cls_name, description=desc)
             count += 1
 
         logger.info("Discovered and registered %d tools from package %s", count, package_name)
+        return count
+    
+    def _apply_tool_config(self, tool_name: str, tool_instance: Any) -> None:
+        """
+        Apply configuration from tools.yaml to a tool instance.
+        Sets attributes on the tool instance based on config.
+        """
+        if not self._tool_configs:
+            return
+        
+        # Get tool config - check both direct name and enabled_tools list
+        tool_config = None
+        if "tools" in self._tool_configs:
+            tools_section = self._tool_configs["tools"]
+            if isinstance(tools_section, dict):
+                tool_config = tools_section.get(tool_name)
+        
+        if not tool_config or not isinstance(tool_config, dict):
+            return
+        
+        logger.debug("Applying config to tool '%s': %s", tool_name, tool_config)
+        
+        # Apply configuration attributes to tool instance
+        for key, value in tool_config.items():
+            try:
+                # Skip module/class keys (they're metadata, not config)
+                if key in ("module", "class"):
+                    continue
+                # Set attribute on tool instance
+                setattr(tool_instance, key, value)
+                logger.debug("Set %s.%s = %s", tool_name, key, value)
+            except Exception as e:
+                logger.debug("Could not set %s.%s: %s", tool_name, key, e)
+    
+    def load_tool_configs(self, configs: Dict[str, Any]) -> None:
+        """
+        Load tool configurations (typically from tools.yaml).
+        
+        Args:
+            configs: Dictionary containing tool configurations, typically from UnifiedConfig.tools
+        """
+        self._tool_configs = configs
+        # Re-apply configs to already registered tools
+        for name, meta in self._tools.items():
+            if meta.instance:
+                self._apply_tool_config(name, meta.instance)
+    
+    def load_mcp_tools(self) -> int:
+        """
+        Load tools from MCP servers via MCP manager.
+        
+        Returns:
+            Number of MCP tools registered
+        """
+        if not self._mcp_manager:
+            return 0
+        
+        count = 0
+        try:
+            mcp_tools = self._mcp_manager.list_tools()
+            for tool_wrapper in mcp_tools:
+                # Register MCP tool with ToolManager
+                self.register_tool(
+                    tool_wrapper.name,
+                    tool_wrapper,
+                    module="agent.mcp",
+                    cls_name="MCPToolWrapper",
+                    description=tool_wrapper.description
+                )
+                count += 1
+            logger.info("Registered %d MCP tools", count)
+        except Exception as e:
+            logger.exception("Failed to load MCP tools: %s", e)
+        
         return count
 
     def _discover_tool_in_module(self, module, modname: str, prefix_strip: bool) -> Tuple[Optional[Any], Optional[str], Optional[str], Optional[str]]:

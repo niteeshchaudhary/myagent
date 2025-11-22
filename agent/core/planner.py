@@ -105,7 +105,29 @@ class Planner:
         
         # Initialize RAG retriever for codebase context (lazy)
         self._retriever = None
-        self.repo_root = getattr(self.config, "repo_root", ".")
+        # Get repo_root from config, or use current working directory
+        self.repo_root = getattr(self.config, "repo_root", None) or os.getcwd()
+        logger.info("Planner initialized with repo_root: %s", self.repo_root)
+        
+        # Detect if using Groq and adjust token limits
+        if self.llm:
+            llm_class_name = self.llm.__class__.__name__ if hasattr(self.llm, "__class__") else ""
+            provider_attr = getattr(self.llm, "provider", None)
+            config_has_groq = False
+            if hasattr(self.llm, "config"):
+                config = self.llm.config
+                if hasattr(config, "model") and config.model:
+                    model_name = str(config.model).lower()
+                    config_has_groq = "groq" in model_name or any(x in model_name for x in ["qwen", "llama-3"])
+            
+            if ("groq" in str(provider_attr).lower() or 
+                "GroqLLM" in llm_class_name or 
+                "groq" in llm_class_name.lower() or
+                config_has_groq):
+                # Groq free tier: 6,000 TPM limit, be very conservative
+                self.config.max_prompt_tokens = min(self.config.max_prompt_tokens, 5000)
+                logger.info("Detected Groq LLM - reducing max_prompt_tokens to %d for free tier compatibility", 
+                           self.config.max_prompt_tokens)
 
     # Public API
     def plan(self, prompt: str, memory: Optional[Union[Dict, str]] = None) -> Union[str, List[Dict[str, Any]]]:
@@ -177,10 +199,15 @@ class Planner:
             return prompt
 
         # Parse the raw plan text into structured steps if possible
-        steps = self._parse_plan_text(raw)
+        steps = self._parse_plan_text(raw, original_prompt=prompt)
         logger.info("Parsed %d steps from planner response", len(steps))
         if steps:
             logger.debug("First step type: %s, action: %s", type(steps[0]), steps[0].get("action") if isinstance(steps[0], dict) else None)
+            # Log the content of LLM steps to debug context issues
+            for i, step in enumerate(steps):
+                if isinstance(step, dict) and step.get("action") == "llm":
+                    step_input = step.get("input", "")
+                    logger.debug("LLM step %d content (first 200 chars): %s", i+1, step_input[:200] if step_input else "(empty)")
         if steps:
             # Trim or enforce max steps
             if len(steps) > self.config.max_steps:
@@ -351,7 +378,7 @@ class Planner:
             logger.exception("LLM single-shot answer failed: %s", e)
             return {"text": ""}
 
-    def _get_codebase_context(self, prompt: str, max_chunks: int = 5) -> str:
+    def _get_codebase_context(self, prompt: str, max_chunks: int = 5, memory: Optional[Union[Dict, str]] = None) -> str:
         """
         Retrieve relevant codebase context using RAG.
         Returns a formatted string with codebase structure and relevant code snippets.
@@ -364,7 +391,13 @@ class Planner:
             if structure:
                 context_parts.append("=== CODEBASE STRUCTURE ===\n" + structure + "\n")
         except Exception as e:
-            logger.debug("Failed to get codebase structure: %s", e)
+            logger.warning("Failed to get codebase structure: %s", e)
+        
+        # Get relevant action history from memory
+        action_history_context = self._get_action_history_context(prompt, memory, max_items=5)
+        if action_history_context:
+            context_parts.append(action_history_context)
+            context_parts.append("\n")
         
         # Use RAG to retrieve relevant code snippets
         try:
@@ -372,17 +405,25 @@ class Planner:
                 try:
                     from agent.rag.retriever import Retriever
                     from agent.rag.config import RagConfig
-                    cfg = RagConfig.from_env()
-                    cfg.repo_root = self.repo_root
+                    # Load RAG config from YAML file (configs/rag.yaml)
+                    # Use current working directory if repo_root not set
+                    repo_root = self.repo_root if self.repo_root and self.repo_root != "." else os.getcwd()
+                    logger.info("Initializing RAG retriever for repo_root: %s", repo_root)
+                    cfg = RagConfig.from_env(repo_root=repo_root)
                     self._retriever = Retriever(cfg)
+                    logger.info("RAG retriever initialized successfully")
                 except Exception as e:
-                    logger.debug("Could not initialize RAG retriever: %s", e)
+                    logger.warning("Could not initialize RAG retriever: %s", e)
+                    logger.debug("RAG retriever initialization error details", exc_info=True)
                     self._retriever = None
             
             if self._retriever:
+                logger.info("Retrieving codebase context for prompt: %s", prompt[:100])
                 chunks = self._retriever.retrieve(prompt, k=max_chunks, use_hybrid=True)
                 if chunks:
+                    logger.info("Retrieved %d code chunks for context", len(chunks))
                     context_parts.append("=== RELEVANT CODE SNIPPETS ===\n")
+                    context_parts.append("Use these code snippets to understand the codebase structure and existing patterns:\n\n")
                     for i, chunk in enumerate(chunks[:max_chunks], 1):
                         path = chunk.get("path", "unknown")
                         start_line = chunk.get("start_line")
@@ -398,8 +439,109 @@ class Planner:
                         
                         context_parts.append(f"[{i}] {location} ({source_type})")
                         context_parts.append(f"```\n{text[:1000]}\n```\n")  # Limit each chunk to 1000 chars
+                else:
+                    logger.warning("RAG retrieval returned no chunks for prompt: %s", prompt[:100])
+            else:
+                logger.warning("RAG retriever not available - codebase context will be limited")
         except Exception as e:
-            logger.debug("RAG retrieval failed: %s", e)
+            logger.warning("RAG retrieval failed: %s", e)
+            logger.debug("RAG retrieval error details", exc_info=True)
+        
+        result = "\n".join(context_parts) if context_parts else ""
+        if result:
+            logger.info("Codebase context retrieved: %d characters", len(result))
+        else:
+            logger.warning("No codebase context retrieved for prompt: %s", prompt[:100])
+        return result
+    
+    def _get_action_history_context(self, prompt: str, memory: Optional[Union[Dict, str]], max_items: int = 5) -> str:
+        """
+        Extract relevant previous actions from memory that are related to the current prompt.
+        Returns formatted string with relevant action history.
+        """
+        if not memory:
+            return ""
+        
+        context_parts = []
+        relevant_actions = []
+        
+        try:
+            # Extract conversation history from memory
+            if isinstance(memory, dict) and "conversation_history" in memory:
+                conv_history = memory.get("conversation_history", [])
+                
+                # Simple keyword matching to find relevant actions
+                prompt_lower = prompt.lower()
+                prompt_keywords = set(prompt_lower.split())
+                
+                for conv in conv_history:
+                    # Check if this action is relevant to the current prompt
+                    relevance_score = 0
+                    action_text = ""
+                    
+                    # Check prompt/request
+                    prev_prompt = conv.get("prompt", "")
+                    if prev_prompt:
+                        prev_prompt_lower = prev_prompt.lower()
+                        prev_keywords = set(prev_prompt_lower.split())
+                        # Count matching keywords
+                        matching = prompt_keywords.intersection(prev_keywords)
+                        relevance_score += len(matching) * 2
+                        action_text += f"Previous request: {prev_prompt[:200]}\n"
+                    
+                    # Check tool/action
+                    tool_info = conv.get("tool", "")
+                    if tool_info:
+                        tool_lower = tool_info.lower()
+                        if any(kw in tool_lower for kw in prompt_keywords if len(kw) > 3):
+                            relevance_score += 3
+                        action_text += f"Tool: {tool_info}\n"
+                    
+                    # Check input
+                    input_data = conv.get("input", "")
+                    if input_data:
+                        input_str = str(input_data).lower()
+                        if any(kw in input_str for kw in prompt_keywords if len(kw) > 3):
+                            relevance_score += 2
+                        action_text += f"Input: {str(input_data)[:200]}\n"
+                    
+                    # Check output/result
+                    output_data = conv.get("output") or conv.get("response") or conv.get("result")
+                    if output_data:
+                        output_str = str(output_data).lower()
+                        if any(kw in output_str for kw in prompt_keywords if len(kw) > 3):
+                            relevance_score += 1
+                        action_text += f"Result: {str(output_data)[:200]}\n"
+                    
+                    # Include if relevant (score > 0) or if it's a recent action
+                    if relevance_score > 0 or len(relevant_actions) < 3:
+                        success = conv.get("success", True)
+                        relevant_actions.append({
+                            "score": relevance_score,
+                            "text": action_text,
+                            "success": success,
+                            "timestamp": conv.get("timestamp", 0)
+                        })
+                
+                # Sort by relevance score (descending) and timestamp (newest first)
+                relevant_actions.sort(key=lambda x: (x["score"], x["timestamp"]), reverse=True)
+                
+                # Take top relevant actions
+                if relevant_actions:
+                    context_parts.append("=== RELEVANT PREVIOUS ACTIONS ===\n")
+                    context_parts.append("These are previous actions that are relevant to the current request. Use them to understand what was done before and build upon it:\n\n")
+                    
+                    for i, action in enumerate(relevant_actions[:max_items], 1):
+                        context_parts.append(f"--- Relevant Action {i} ---")
+                        context_parts.append(action["text"])
+                        if not action["success"]:
+                            context_parts.append("⚠️ This action FAILED - avoid repeating the same approach")
+                        context_parts.append("")
+                    
+                    logger.info("Included %d relevant previous actions in context", len(relevant_actions[:max_items]))
+        except Exception as e:
+            logger.warning("Failed to extract action history context: %s", e)
+            logger.debug("Action history extraction error details", exc_info=True)
         
         return "\n".join(context_parts) if context_parts else ""
     
@@ -484,7 +626,14 @@ class Planner:
         
         parts.append(
             "You are a helpful coding assistant working with an existing codebase. Given the user's request, produce a step-by-step plan "
-            "to accomplish the task. Prefer a JSON array named 'steps', where each step is an object with keys:\n"
+            "to accomplish the task.\n\n"
+            "CRITICAL: Before creating or writing any file, SEARCH the codebase context above and choose an existing file to modify."
+            "If the change affects an existing file, RETURN A GIT-STYLE UNIFIED DIFF (diff --git a/... b/...) wrapped in a ```diff code fence."
+            "If you must add a new file, return a diff that adds the new file (git unified diff format)."
+            "Do NOT return raw file contents unless the step is explicitly a file write tool step and you reference an exact path already present in the codebase context."
+            "CRITICAL OUTPUT FORMAT: You MUST return ONLY a valid JSON array of step objects. Do NOT include any reasoning, explanation, or text outside the JSON array. "
+            "Start your response with '[' and end with ']'. No markdown, no code blocks, just pure JSON.\n\n"
+            "Each step is an object with keys:\n"
             "  - action: one of 'tool', 'llm', or 'finish'\n"
             "  - tool: (for 'tool' actions) the canonical tool name to call\n"
             "  - input: input to the tool or content for the LLM\n"
@@ -496,17 +645,29 @@ class Planner:
             "4. For file creation, use: {\"action\": \"tool\", \"tool\": \"file_editor\", \"input\": {\"action\": \"write\", \"path\": \"filename.ext\", \"content\": \"file content\"}}\n"
             "5. Match the existing code style, patterns, and structure. Look at similar files in the codebase.\n"
             "6. Do not just provide instructions - use tools to perform actions.\n"
-            "7. NEVER write code directly in LLM output - ALWAYS use file_editor tool to create files.\n\n"
+            "7. NEVER write code directly in LLM output - ALWAYS use file_editor tool to create files.\n"
+            "8. DO NOT include reasoning or explanations in your response - ONLY return the JSON array.\n\n"
         )
         
-        # Add codebase context
+        # Add codebase context - CRITICAL for understanding the codebase
         try:
-            codebase_context = self._get_codebase_context(prompt, max_chunks=5)
+            codebase_context = self._get_codebase_context(prompt, max_chunks=8, memory=memory)  # Include memory for action history
             if codebase_context:
+                parts.append("=== CODEBASE CONTEXT ===")
+                parts.append("IMPORTANT: Use the codebase context below to understand the existing code structure, patterns, and files.")
+                parts.append("This context shows relevant code from the repository. Use it to:")
+                parts.append("1. Understand what files exist and their structure")
+                parts.append("2. Match existing code style and patterns")
+                parts.append("3. Find where to add new code or make changes")
+                parts.append("4. Understand navigation/routing patterns if working with web apps\n")
                 parts.append(codebase_context)
                 parts.append("\n")
+            else:
+                logger.warning("No codebase context available - planner will work without codebase knowledge")
+                parts.append("NOTE: Codebase context is not available. You may need to ask the user for more details about their codebase structure.\n")
         except Exception as e:
-            logger.debug("Failed to get codebase context: %s", e)
+            logger.warning("Failed to get codebase context: %s", e)
+            logger.debug("Codebase context error details", exc_info=True)
         
         # Add available tools information
         if available_tools:
@@ -533,24 +694,41 @@ class Planner:
             if isinstance(memory, dict) and "conversation_history" in memory:
                 conv_history = memory.get("conversation_history", [])
                 if conv_history:
-                    memory_parts.append("Recent conversation history (most recent first):\n")
-                    for i, conv in enumerate(conv_history[:10], 1):  # Show last 10 conversations
+                    memory_parts.append("=== PREVIOUS ACTIONS AND CONVERSATIONS ===\n")
+                    memory_parts.append("These are relevant previous actions based on the current request. Use them to understand context and avoid repeating work.\n")
+                    for i, conv in enumerate(conv_history[:15], 1):  # Show last 15 conversations
                         prompt = conv.get("prompt", "")
                         response = conv.get("response", "")
                         tool_info = conv.get("tool", "")
+                        success = conv.get("success", True)
+                        todo_index = conv.get("todo_index")
                         
                         if prompt or response:
-                            memory_parts.append(f"\n--- Conversation {i} ---")
+                            memory_parts.append(f"\n--- Previous Request {i} ---")
                             if prompt:
-                                memory_parts.append(f"User: {prompt[:300]}{'...' if len(prompt) > 300 else ''}")
+                                memory_parts.append(f"User asked: {prompt[:300]}{'...' if len(prompt) > 300 else ''}")
                             if response:
                                 resp_str = str(response)[:300] + ('...' if len(str(response)) > 300 else '')
-                                memory_parts.append(f"Agent: {resp_str}")
+                                memory_parts.append(f"Agent response: {resp_str}")
                         elif tool_info:
-                            memory_parts.append(f"\n--- Action {i} ---")
-                            memory_parts.append(f"Tool: {tool_info}")
+                            memory_parts.append(f"\n--- Previous Action {i} ---")
+                            memory_parts.append(f"Tool executed: {tool_info}")
                             if conv.get("input"):
-                                memory_parts.append(f"Input: {str(conv.get('input'))[:200]}")
+                                input_str = str(conv.get("input"))[:200]
+                                memory_parts.append(f"Command/Input: {input_str}")
+                            if "output" in conv:
+                                output_str = str(conv.get("output"))[:200]
+                                memory_parts.append(f"Result: {output_str}")
+                            if not success:
+                                memory_parts.append("⚠️ This action FAILED - avoid repeating it")
+                        elif todo_index is not None:
+                            memory_parts.append(f"\n--- Previous Todo Step {i} ---")
+                            step = conv.get("step", {})
+                            step_desc = str(step.get("input", step.get("prompt", "")))[:200]
+                            memory_parts.append(f"Step: {step_desc}")
+                            if conv.get("result"):
+                                result_str = str(conv.get("result"))[:200]
+                                memory_parts.append(f"Result: {result_str}")
                     
                     memory_parts.append("\n")
             
@@ -573,9 +751,13 @@ class Planner:
                 # Add instruction to use conversation history
                 if isinstance(memory, dict) and "conversation_history" in memory and memory.get("conversation_history"):
                     parts.append(
-                        "IMPORTANT: Use the conversation history above to understand the context of previous interactions. "
-                        "The current user request may be a follow-up to a previous conversation. "
-                        "Consider what was discussed, what files were created, what actions were taken, and build upon that context.\n\n"
+                        "CRITICAL INSTRUCTIONS FOR USING MEMORY:\n"
+                        "1. Review the previous actions above to understand what has already been done.\n"
+                        "2. If the current request is similar to a previous one, build upon that work instead of starting from scratch.\n"
+                        "3. If a previous action failed, learn from the error and try a different approach.\n"
+                        "4. If files were created or modified in previous actions, reference them in your plan.\n"
+                        "5. Avoid repeating actions that were already completed successfully.\n"
+                        "6. Use the codebase context below to understand the current state of files.\n\n"
                     )
             else:
                 # Fallback to JSON dump if no conversation history found
@@ -610,24 +792,28 @@ class Planner:
             )
         
         parts.append(
-            "Return only valid JSON. Example:\n"
+            "\n=== OUTPUT FORMAT ===\n"
+            "You MUST return ONLY a valid JSON array. No reasoning, no explanations, no markdown code blocks, just pure JSON starting with '[' and ending with ']'.\n\n"
+            "Example output (copy this format exactly):\n"
             '[\n'
             '  { "action": "tool", "tool": "file_editor", "input": { "action": "write", "path": "src/App.js", "content": "import React..." } },\n'
             '  { "action": "tool", "tool": "shell", "input": "npm install", "meta": {} },\n'
             '  { "action": "finish", "output": "Done." }\n'
-            "]\n"
+            "]\n\n"
+            "REMEMBER: Start with '[' and end with ']'. No other text before or after. Just the JSON array.\n"
         )
         if self.config.prompt_suffix:
             parts.append(self.config.prompt_suffix)
         return "\n".join(parts)
 
-    def _parse_plan_text(self, raw: Optional[str]) -> List[Dict[str, Any]]:
+    def _parse_plan_text(self, raw: Optional[str], original_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Try to parse a plan returned by the LLM into a list of step dicts.
         Handles:
          - bare JSON arrays
          - JSON inside markdown/code blocks
          - simple line-by-line "1) do X" lists -> converted to steps with action 'llm'
+         - reasoning text with code blocks -> extracts code blocks as file_editor steps
         Returns an empty list on failure.
         """
         if not raw:
@@ -642,48 +828,107 @@ class Planner:
             candidate = code_block_match.group(1).strip()
             steps = self._try_parse_json(candidate)
             if steps:
-                return self._normalize_steps(steps)
+                logger.info("Successfully parsed JSON from code block")
+                return self._normalize_steps(steps, original_prompt=original_prompt)
 
         # 2) Try to parse entire text as JSON
         steps = self._try_parse_json(text)
         if steps:
-            return self._normalize_steps(steps)
+            logger.info("Successfully parsed JSON from entire text")
+            return self._normalize_steps(steps, original_prompt=original_prompt)
 
         # 3) Heuristic: find first bracketed JSON substring if present
-        bracket_match = re.search(r"(\[.*\])", text, flags=re.DOTALL)
-        if bracket_match:
-            candidate = bracket_match.group(1)
-            steps = self._try_parse_json(candidate)
-            if steps:
-                return self._normalize_steps(steps)
+        # Try multiple patterns to find JSON array
+        bracket_patterns = [
+            r"(\[[\s\S]*?\])",  # Simple array
+            r'(\{[\s\S]*?"steps"[\s\S]*?:[\s\S]*?\[[\s\S]*?\][\s\S]*?\})',  # Object with "steps" key
+        ]
+        for pattern in bracket_patterns:
+            bracket_match = re.search(pattern, text, flags=re.DOTALL)
+            if bracket_match:
+                candidate = bracket_match.group(1)
+                steps = self._try_parse_json(candidate)
+                if steps:
+                    logger.info("Successfully parsed JSON from bracket pattern")
+                    return self._normalize_steps(steps, original_prompt=original_prompt)
 
-        # 4) Fallback: parse as numbered or bulleted list
-        # First, check if there are code blocks that should be converted to file_editor steps
+        # 4) Fallback: If we have code blocks, extract them as tool steps (shell or file_editor)
+        # This handles cases where LLM returns reasoning text with code blocks
         code_block_pattern = re.compile(r'```(?:(\w+))?\s*\n(.*?)```', re.DOTALL | re.IGNORECASE)
         code_blocks = code_block_pattern.findall(text)
         
         if code_blocks:
-            logger.info("Found %d code blocks in planner response, converting to file_editor steps", len(code_blocks))
-            file_steps = []
+            logger.warning("Planner returned reasoning text instead of JSON. Found %d code blocks, converting to tool steps", len(code_blocks))
+            steps_list = []
+            
+            # Shell command patterns - if code matches these, it's a command, not a file
+            shell_command_patterns = [
+                r'^\s*(npm|npx|yarn|pnpm)\s+',  # Package managers
+                r'^\s*(git|docker|kubectl|helm)\s+',  # Common CLI tools
+                r'^\s*(cd|mkdir|rm|cp|mv|ls|cat|grep|find|chmod|chown)\s+',  # Unix commands
+                r'^\s*(python|node|ruby|php|java|go|rustc|cargo|g\+\+|gcc|clang)\s+',  # Runtimes/compilers
+                r'^\s*(curl|wget|ssh|scp|rsync)\s+',  # Network/file transfer
+                r'^\s*(sudo|su|apt|yum|brew|pip|conda)\s+',  # System/package commands
+                r'^\s*(echo|export|source|\.\/|\.\.\/)',  # Shell builtins/paths
+            ]
+            
             for i, (lang, code) in enumerate(code_blocks):
                 code = code.strip()
+                # Skip very short code blocks and JSON blocks (already tried those)
                 if not code or len(code) < 10:
                     continue
+                # Skip if it looks like JSON (already tried parsing it)
+                if lang and lang.lower() == "json":
+                    continue
+                if code.strip().startswith("{") or code.strip().startswith("["):
+                    # Might be JSON, skip
+                    continue
                 
-                # Try to find filename in context before code block
+                # Check if this is a shell command
+                is_shell_command = False
+                if lang and lang.lower() in ("bash", "sh", "shell", "cmd", "powershell"):
+                    is_shell_command = True
+                else:
+                    # Check if code matches shell command patterns
+                    for pattern in shell_command_patterns:
+                        if re.match(pattern, code, re.IGNORECASE):
+                            is_shell_command = True
+                            break
+                
+                if is_shell_command:
+                    # This is a shell command - create shell tool step
+                    logger.info("Detected shell command in code block %d: %s", i+1, code[:50])
+                    steps_list.append({
+                        "action": "tool",
+                        "tool": "shell",
+                        "input": code
+                    })
+                    continue
+                
+                # Try to find filename in context before code block (look further back)
                 block_start = text.find(f"```{lang or ''}")
-                context_start = max(0, block_start - 200)
+                if block_start == -1:
+                    # Try without language
+                    block_start = text.find("```")
+                context_start = max(0, block_start - 500)  # Look back 500 chars
                 context = text[context_start:block_start]
                 
-                # Look for file path mentions
-                file_match = re.search(
-                    r'(?:create|write|add|generate|make|file|save|as)\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?(?:named\s+)?["\']?([^\s"\']+\.(?:js|jsx|ts|tsx|py|java|cpp|c|h|html|css|json|xml|yaml|yml|md|txt|sh|bash))["\']?',
-                    context, re.IGNORECASE
-                )
+                # Look for file path mentions with more patterns
+                file_patterns = [
+                    r'(?:create|write|add|generate|make|file|save|as|named|call(?:ed)?)\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?(?:named\s+)?["\']?([^\s"\']+\.(?:js|jsx|ts|tsx|py|java|cpp|c|h|html|css|json|xml|yaml|yml|md|txt|sh|bash))["\']?',
+                    r'([^\s"\']+\.(?:js|jsx|ts|tsx|py|java|cpp|c|h|html|css|json|xml|yaml|yml|md|txt|sh|bash))',  # Any file path
+                ]
                 
-                if file_match:
-                    file_path = file_match.group(1)
-                else:
+                file_path = None
+                for pattern in file_patterns:
+                    file_match = re.search(pattern, context, re.IGNORECASE)
+                    if file_match:
+                        file_path = file_match.group(1)
+                        # Clean up the path (remove quotes, etc.)
+                        file_path = file_path.strip('"\'')
+                        break
+                
+                if not file_path:
                     # Infer from language and code content
                     lang_ext_map = {
                         "javascript": "js", "js": "js", "jsx": "jsx",
@@ -700,16 +945,42 @@ class Planner:
                     ext = lang_ext_map.get((lang or "").lower(), "txt")
                     
                     # React-specific detection
-                    if "import React" in code or "from 'react'" in code or "from \"react\"" in code:
+                    if "import React" in code or "from 'react'" in code or "from \"react\"" in code or "from \"react\"" in code:
                         if ext == "js":
                             ext = "jsx"
+                        # Try to extract component name
+                        comp_match = re.search(r'(?:function|const|class)\s+(\w+)', code)
+                        if comp_match:
+                            comp_name = comp_match.group(1)
+                            file_path = f"src/{comp_name}.{ext}"
+                        else:
+                            file_path = f"src/App.{ext}"
+                    elif "function App" in code or "const App" in code or "export default App" in code:
                         file_path = f"src/App.{ext}"
-                    elif "function App" in code or "const App" in code:
-                        file_path = f"src/App.{ext}"
+                    elif "export default" in code:
+                        # Try to extract component name
+                        comp_match = re.search(r'(?:export\s+default\s+)?(?:function|const|class)\s+(\w+)', code)
+                        if comp_match:
+                            comp_name = comp_match.group(1)
+                            file_path = f"src/{comp_name}.{ext}"
+                        else:
+                            file_path = f"src/Component{i+1}.{ext}"
                     else:
                         file_path = f"src/Component{i+1}.{ext}"
                 
-                file_steps.append({
+                # Additional check: if code looks like a single command line, it's probably a shell command
+                lines = code.split('\n')
+                if len(lines) == 1 and (' ' in code or code.startswith('./') or code.startswith('../')):
+                    # Single line with spaces or path - likely a command
+                    logger.info("Code block %d looks like a single command, creating shell step instead", i+1)
+                    steps_list.append({
+                        "action": "tool",
+                        "tool": "shell",
+                        "input": code
+                    })
+                    continue
+                
+                steps_list.append({
                     "action": "tool",
                     "tool": "file_editor",
                     "input": {
@@ -718,10 +989,14 @@ class Planner:
                         "content": code
                     }
                 })
-                logger.info("Converted code block to file_editor step: %s", file_path)
+                logger.info("Converted code block %d to file_editor step: %s", i+1, file_path)
             
-            if file_steps:
-                return self._normalize_steps(file_steps)
+            if steps_list:
+                logger.info("Returning %d tool steps extracted from code blocks (%d shell, %d file_editor)", 
+                           len(steps_list), 
+                           sum(1 for s in steps_list if s.get("tool") == "shell"),
+                           sum(1 for s in steps_list if s.get("tool") == "file_editor"))
+                return self._normalize_steps(steps_list, original_prompt=original_prompt)
         
         # 5) Final fallback: parse as numbered or bulleted list into LLM steps
         lines = [l.strip(" -\t\r\n") for l in text.splitlines() if l.strip()]
@@ -735,7 +1010,7 @@ class Planner:
                 ln_clean = re.sub(r"^\s*[\d\-\.\)\(a-zA-Z]+\s*", "", ln)
                 parsed_steps.append({"action": "llm", "input": ln_clean})
             if parsed_steps:
-                return self._normalize_steps(parsed_steps)
+                return self._normalize_steps(parsed_steps, original_prompt=original_prompt)
 
         # 5) give up
         logger.debug("Could not parse plan into structured steps; returning empty list.")
@@ -775,9 +1050,157 @@ class Planner:
             return data
         return []
 
-    def _normalize_steps(self, raw_steps: Sequence) -> List[Dict[str, Any]]:
+    def _extract_code_blocks_from_llm_input(self, input_text: str, original_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Extract code blocks from LLM step input and convert to tool steps.
+        Similar to agent_loop's _extract_code_blocks_from_output but for planner context.
+        """
+        import re
+        steps = []
+        
+        if not input_text or "```" not in input_text:
+            return steps
+        
+        # Extract all code blocks with their language hints
+        code_block_pattern = re.compile(
+            r'```(?:(\w+))?\s*\n(.*?)```',
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        code_blocks = code_block_pattern.findall(input_text)
+        logger.debug("Found %d code blocks in LLM step input", len(code_blocks))
+        
+        # Shell command patterns
+        shell_command_patterns = [
+            r'^\s*(npm|npx|yarn|pnpm)\s+',
+            r'^\s*(git|docker|kubectl|helm)\s+',
+            r'^\s*(cd|mkdir|rm|cp|mv|ls|cat|grep|find|chmod|chown)\s+',
+            r'^\s*(python|node|ruby|php|java|go|rustc|cargo|g\+\+|gcc|clang)\s+',
+            r'^\s*(curl|wget|ssh|scp|rsync)\s+',
+            r'^\s*(sudo|su|apt|yum|brew|pip|conda)\s+',
+            r'^\s*(echo|export|source|\.\/|\.\.\/)',
+        ]
+        
+        for i, (lang, code) in enumerate(code_blocks):
+            code = code.strip()
+            if not code or len(code) < 10:
+                continue
+            # Skip JSON blocks (those are for plans, not code)
+            if lang and lang.lower() == "json":
+                continue
+            if code.strip().startswith("{") or code.strip().startswith("["):
+                # Might be JSON, skip
+                continue
+            
+            # Check if this is a shell command
+            is_shell_command = False
+            if lang and lang.lower() in ("bash", "sh", "shell", "cmd", "powershell"):
+                is_shell_command = True
+            else:
+                for pattern in shell_command_patterns:
+                    if re.match(pattern, code, re.IGNORECASE):
+                        is_shell_command = True
+                        break
+            
+            if is_shell_command:
+                steps.append({
+                    "action": "tool",
+                    "tool": "shell",
+                    "input": code
+                })
+                continue
+            
+            # Look for file path mentions
+            block_start = input_text.find(f"```{lang or ''}")
+            if block_start == -1:
+                block_start = input_text.find("```")
+            context_start = max(0, block_start - 500)
+            context = input_text[context_start:block_start]
+            
+            file_patterns = [
+                r'(?:create|write|add|generate|make|file|save|as|named|call(?:ed)?)\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?(?:named\s+)?["\']?([^\s"\']+\.(?:js|jsx|ts|tsx|py|java|cpp|c|h|html|css|json|xml|yaml|yml|md|txt|sh|bash))["\']?',
+                r'([^\s"\']+\.(?:js|jsx|ts|tsx|py|java|cpp|c|h|html|css|json|xml|yaml|yml|md|txt|sh|bash))',
+            ]
+            
+            file_path = None
+            for pattern in file_patterns:
+                file_match = re.search(pattern, context, re.IGNORECASE)
+                if file_match:
+                    file_path = file_match.group(1).strip('"\'')
+                    break
+            
+            if not file_path:
+                # Infer from language
+                lang_ext_map = {
+                    "javascript": "js", "js": "js", "jsx": "jsx",
+                    "typescript": "ts", "ts": "ts", "tsx": "tsx",
+                    "python": "py", "py": "py",
+                    "java": "java",
+                    "cpp": "cpp", "c++": "cpp", "c": "c",
+                    "html": "html", "css": "css",
+                    "yaml": "yaml", "yml": "yml",
+                    "markdown": "md", "md": "md",
+                    "bash": "sh", "sh": "sh", "shell": "sh"
+                }
+                ext = lang_ext_map.get((lang or "").lower(), "txt") if lang else "txt"
+                
+                if "import React" in code or "from 'react'" in code or "from \"react\"" in code:
+                    if ext == "js":
+                        ext = "jsx"
+                    comp_match = re.search(r'(?:function|const|class)\s+(\w+)', code)
+                    if comp_match:
+                        file_path = f"src/{comp_match.group(1)}.{ext}"
+                    else:
+                        file_path = f"src/App.{ext}"
+                elif "function App" in code or "const App" in code:
+                    file_path = f"src/App.{ext}"
+                elif "export default" in code:
+                    comp_match = re.search(r'(?:export\s+default\s+)?(?:function|const|class)\s+(\w+)', code)
+                    if comp_match:
+                        file_path = f"src/{comp_match.group(1)}.{ext}"
+                    else:
+                        file_path = f"src/Component{i+1}.{ext}"
+                else:
+                    file_path = f"src/Component{i+1}.{ext}"
+            
+            # Validation checks
+            lines = code.split('\n')
+            if len(lines) == 1 and (' ' in code or code.startswith('./') or code.startswith('../')):
+                continue
+            
+            content_lines = [line.strip() for line in lines if line.strip()]
+            if len(content_lines) < 2:
+                continue
+            
+            if len(code.strip()) < 50:
+                continue
+            
+            if file_path.count('/') > 5:
+                continue
+            
+            if file_path.startswith('../') or file_path.startswith('/'):
+                continue
+            
+            steps.append({
+                "action": "tool",
+                "tool": "file_editor",
+                "input": {
+                    "action": "write",
+                    "path": file_path,
+                    "content": code
+                }
+            })
+            logger.debug("Extracted code block %d as file_editor step: %s", i+1, file_path)
+        
+        return steps
+
+    def _normalize_steps(self, raw_steps: Sequence, original_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Normalize various step shapes into canonical dicts.
+        
+        Args:
+            raw_steps: Raw step data to normalize
+            original_prompt: Original user prompt (optional, used to validate LLM step content)
         """
         steps_out: List[Dict[str, Any]] = []
         for item in raw_steps:
@@ -798,6 +1221,39 @@ class Planner:
                     "input": item.get("input") or item.get("prompt") or item.get("content") or item.get("query"),
                     "meta": item.get("meta") or {},
                 }
+                
+                # For LLM steps, ensure content relates to original prompt
+                if action == "llm" and original_prompt:
+                    step_input = step.get("input", "")
+                    # If content is suspiciously short or doesn't relate to prompt, prepend original prompt
+                    if not step_input or len(step_input) < 50:
+                        logger.warning("LLM step has suspiciously short or empty content. Prepending original prompt.")
+                        step["input"] = f"User request: {original_prompt}\n\n{step_input}" if step_input else original_prompt
+                    elif not any(word.lower() in step_input.lower() for word in original_prompt.split()[:5] if len(word) > 3):
+                        logger.warning("LLM step content doesn't appear related to original prompt. Prepending original prompt for context.")
+                        step["input"] = f"User request: {original_prompt}\n\n{step_input}"
+                
+                # Check if LLM step input contains code blocks that should be converted to tool steps
+                if action == "llm":
+                    step_input = step.get("input", "")
+                    if step_input and "```" in step_input:
+                        # Check if this looks like file creation intent
+                        prompt_lower = (str(original_prompt or "") + " " + str(step_input)).lower()
+                        has_file_creation_intent = any(keyword in prompt_lower for keyword in [
+                            "create", "write", "generate", "make", "add", "file", "code", "component",
+                            "application", "app", "implement", "build"
+                        ])
+                        
+                        if has_file_creation_intent:
+                            logger.info("LLM step input contains code blocks and file creation intent. Attempting to extract tool steps...")
+                            # Try to extract code blocks from the input
+                            extracted_steps = self._extract_code_blocks_from_llm_input(step_input, original_prompt)
+                            if extracted_steps:
+                                logger.info("Converted LLM step with code blocks into %d tool steps", len(extracted_steps))
+                                # Replace the LLM step with extracted tool steps
+                                steps_out.extend(extracted_steps)
+                                continue
+                
                 # include output/result if present
                 if "output" in item:
                     step["output"] = item["output"]
@@ -806,7 +1262,10 @@ class Planner:
                 steps_out.append(step)
             else:
                 # non-dict item -> coerce to llm step
-                steps_out.append({"action": "llm", "input": str(item)})
+                input_content = str(item)
+                if original_prompt and (not input_content or len(input_content) < 50):
+                    input_content = original_prompt
+                steps_out.append({"action": "llm", "input": input_content})
         return steps_out
 
     # -------------------------
